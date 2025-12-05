@@ -42,6 +42,9 @@ class PluginRow:
         self.folder_name = folder_name
         self.full_path = os.path.join(app.nodes_path, folder_name)
         
+        # 状态标志
+        self.is_update_available = False
+        
         # UI 容器
         self.frame = tk.Frame(parent_frame, bd=1, relief=tk.RIDGE, bg="white")
         self.frame.pack(fill="x", pady=2, padx=5)
@@ -98,9 +101,12 @@ class PluginRow:
         
         code, out, _ = self.run_git(["status", "-uno"])
         if "behind" in out or "落后" in out:
+            self.is_update_available = True
             return "检测到新版本", "red"
         elif "detached" in out:
              return "处于历史版本", "orange"
+        
+        self.is_update_available = False
         return "最新版本", "green"
 
     def fetch_versions(self):
@@ -135,22 +141,25 @@ class PluginRow:
 
         if messagebox.askyesno("确认", f"对插件 {self.folder_name} 执行:\n{selection}?"):
             self.btn_action.config(state="disabled", text="执行中...")
-            threading.Thread(target=self.do_update, args=(selection,), daemon=True).start()
+            # 手动点击 silent=False
+            threading.Thread(target=self.do_update, args=(selection, False), daemon=True).start()
 
-    def do_update(self, selection):
+    def do_update(self, selection, silent=False):
+        """ 执行更新逻辑 
+        :param silent: 是否静默模式（不弹成功窗，主要用于批量更新）
+        """
         try:
             # 内部函数：检测冲突并尝试强制重置
             def try_force_reset(err_msg):
                 keywords = ["overwritten by merge", "stash them", "local changes", "aborted"]
-                # 如果错误信息包含关键词，询问是否强制重置
                 if any(k in err_msg for k in keywords):
+                    # 冲突时无论是否 silent 都需要弹窗询问，因为涉及数据丢失风险
                     if messagebox.askyesno("冲突解决", 
                         f"检测到插件 {self.folder_name} 有本地修改，导致更新失败。\n\nGit报错片段:\n{err_msg[:200]}...\n\n是否【丢弃本地修改】并强制更新？\n(警告：您的修改将无法恢复！)"):
                         
-                        # 执行 reset --hard HEAD
                         r_code, _, r_err = self.run_git(["reset", "--hard", "HEAD"])
                         if r_code == 0:
-                            return True # 重置成功
+                            return True 
                         else:
                             messagebox.showerror("重置失败", f"无法自动修复，请手动删除该插件文件夹重新安装。\n\n错误: {r_err}")
                             return False
@@ -159,7 +168,7 @@ class PluginRow:
             if "最新版本" in selection:
                 # 逻辑：切回主分支并 Pull
                 code, out, _ = self.run_git(["remote", "show", "origin"])
-                head_branch = "master" # 默认
+                head_branch = "master" 
                 if "HEAD branch" in out:
                     for line in out.splitlines():
                         if "HEAD branch" in line:
@@ -169,31 +178,31 @@ class PluginRow:
                 self.run_git(["checkout", head_branch])
                 code, out, err = self.run_git(["pull"])
                 
-                # --- 新增：冲突自动处理逻辑 ---
+                # 冲突自动处理逻辑
                 if code != 0:
                     if try_force_reset(err):
-                        # 如果用户同意并重置成功，再试一次 pull
                         code, out, err = self.run_git(["pull"])
-                # ---------------------------
 
                 if code == 0:
                     self.update_ui_status("更新成功", "green")
-                    messagebox.showinfo("成功", f"{self.folder_name} 已更新到最新。")
+                    self.is_update_available = False # 更新后重置标志
+                    if not silent:
+                        messagebox.showinfo("成功", f"{self.folder_name} 已更新到最新。")
                 else:
                     self.update_ui_status("更新失败", "red")
-                    messagebox.showerror("失败", f"{self.folder_name} 更新失败:\n{err}")
+                    # 失败即使在 silent 模式下也可以考虑记录日志，这里暂保留弹窗或控制台输出
+                    if not silent:
+                        messagebox.showerror("失败", f"{self.folder_name} 更新失败:\n{err}")
+                    else:
+                        print(f"[Error] {self.folder_name} 更新失败: {err}")
 
             elif "Tag:" in selection or "Commit:" in selection:
-                # 切换到 Tag 或 Commit
                 target = selection.replace("Tag: ", "").strip() if "Tag:" in selection else selection.split(" ")[1].strip()
-                
                 code, _, err = self.run_git(["checkout", target])
                 
-                # --- 新增：冲突自动处理逻辑 ---
                 if code != 0:
                     if try_force_reset(err):
                         code, _, err = self.run_git(["checkout", target])
-                # ---------------------------
 
                 if code == 0:
                     self.update_ui_status(f"已回退: {target}", "orange")
@@ -210,13 +219,17 @@ class PluginRow:
 class ComfyUpdaterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ComfyUI 插件管理器 (冲突修复/版本回退版)")
+        self.root.title("ComfyUI 插件管理器 (增强版)")
         self.root.geometry("1000x700")
 
         self.config = configparser.ConfigParser()
         self.git_exe = "git"
         self.nodes_path = ""
+        self.proxy_url = "" # 新增：代理地址
         self.load_config()
+
+        # 列表引用，用于批量操作
+        self.plugin_rows = []
 
         # 1. 顶部控制栏
         top_frame = tk.Frame(root, pady=10)
@@ -226,14 +239,19 @@ class ComfyUpdaterApp:
         self.path_label = tk.Label(top_frame, text=self.nodes_path or "未选择", fg="blue")
         self.path_label.pack(side="left")
         
-        tk.Button(top_frame, text="刷新列表", command=self.refresh_list, bg="#dddddd").pack(side="right", padx=10)
+        # 右侧按钮组
+        tk.Button(top_frame, text="刷新列表", command=self.refresh_list, bg="#dddddd").pack(side="right", padx=5)
+        
+        # 新增：一键更新按钮
+        self.btn_update_all = tk.Button(top_frame, text="一键更新可更新项", command=self.update_all_plugins, bg="#c8e6c9", fg="black")
+        self.btn_update_all.pack(side="right", padx=5)
 
-        # 2. 列表区域 (使用自定义的 ScrollableFrame)
+        # 2. 列表区域
         self.list_container = ScrollableFrame(root)
         self.list_container.pack(fill="both", expand=True, padx=10, pady=5)
 
         # 3. 底部状态栏
-        self.status_bar = tk.Label(root, text="就绪", bd=1, relief=tk.SUNKEN, anchor="w")
+        self.status_bar = tk.Label(root, text=f"就绪 (代理: {self.proxy_url if self.proxy_url else '无'})", bd=1, relief=tk.SUNKEN, anchor="w")
         self.status_bar.pack(side="bottom", fill="x")
 
         if self.nodes_path and os.path.exists(self.nodes_path):
@@ -248,6 +266,10 @@ class ComfyUpdaterApp:
                 p = self.config['Settings'].get('custom_nodes_path', '').strip()
                 if p:
                     self.nodes_path = p if os.path.isabs(p) else os.path.abspath(os.path.join(os.getcwd(), p))
+            
+            # 读取代理设置
+            if 'Network' in self.config:
+                self.proxy_url = self.config['Network'].get('https_proxy', '').strip()
         except: pass
 
     def select_directory(self):
@@ -265,15 +287,20 @@ class ComfyUpdaterApp:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # 防弹窗环境变量
+            # 设置环境变量
             env = os.environ.copy()
             env["GIT_TERMINAL_PROMPT"] = "0"
             env["GCM_INTERACTIVE"] = "never"
+            
+            # 应用代理
+            if self.proxy_url:
+                env["http_proxy"] = self.proxy_url
+                env["https_proxy"] = self.proxy_url
 
             result = subprocess.run(
                 cmd, cwd=folder_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding='utf-8', errors='ignore', 
-                startupinfo=startupinfo, env=env, timeout=45
+                startupinfo=startupinfo, env=env, timeout=60 # 增加超时时间以适应代理延迟
             )
             return result.returncode, result.stdout.strip(), result.stderr.strip()
         except Exception as e:
@@ -283,16 +310,45 @@ class ComfyUpdaterApp:
         # 清空旧列表
         for widget in self.list_container.scrollable_frame.winfo_children():
             widget.destroy()
+        self.plugin_rows.clear()
 
         if not os.path.exists(self.nodes_path): return
 
         folders = [f for f in os.listdir(self.nodes_path) if os.path.isdir(os.path.join(self.nodes_path, f))]
-        self.status_bar.config(text=f"发现 {len(folders)} 个插件")
+        self.status_bar.config(text=f"发现 {len(folders)} 个插件 | 代理: {self.proxy_url if self.proxy_url else '无'}")
 
-        # 使用线程池并发创建 UI 行 (主要是为了不卡顿，虽然UI必须在主线程，但数据预取可以在后台)
-        # 这里直接在主线程创建UI对象，数据加载在对象内部是异步的
+        # 创建行
         for folder in folders:
-            PluginRow(self.list_container.scrollable_frame, self, folder)
+            row = PluginRow(self.list_container.scrollable_frame, self, folder)
+            self.plugin_rows.append(row)
+
+    def update_all_plugins(self):
+        """ 批量更新逻辑 """
+        targets = [row for row in self.plugin_rows if row.is_update_available]
+        
+        if not targets:
+            messagebox.showinfo("提示", "当前没有检测到需要更新的插件。\n(请确保列表已刷新且显示为红色状态)")
+            return
+
+        if not messagebox.askyesno("批量更新", f"检测到 {len(targets)} 个插件有新版本。\n\n是否开始批量更新？"):
+            return
+
+        self.btn_update_all.config(state="disabled", text="正在更新...")
+        
+        def run_batch():
+            # 使用线程池并发更新，最大5个并发，避免卡死或被封锁
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                for row in targets:
+                    # 这里的 UI 状态更新需要在 do_update 内部处理，或者这里不做处理
+                    # 调用 silent=True 模式
+                    row.btn_action.config(state="disabled", text="队列中...")
+                    executor.submit(row.do_update, "最新版本 (Latest)", True)
+            
+            # 完成后恢复按钮
+            self.root.after(0, lambda: self.btn_update_all.config(state="normal", text="一键更新可更新项"))
+            self.root.after(0, lambda: messagebox.showinfo("完成", "批量更新流程已结束，请查看各插件状态。"))
+
+        threading.Thread(target=run_batch, daemon=True).start()
 
 if __name__ == "__main__":
     root = tk.Tk()

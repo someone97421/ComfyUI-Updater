@@ -38,12 +38,12 @@ if not exist "%PYTHON_EXE%" (
 )
 
 echo 使用 Python: %PYTHON_EXE%
-echo 启动中...
+echo running...
 
 :: 启动 Python 脚本
 "%PYTHON_EXE%" "%SCRIPT_FILE%"
 
 if %errorlevel% neq 0 (
-    echo 程序异常退出。
+    echo Error
     pause
 )
