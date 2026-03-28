@@ -48,10 +48,10 @@ class GitItemBase:
         self.has_requirements = os.path.exists(req_path)
         return self.has_requirements
 
-    def run_cmd_generic(self, cmd_args, cwd=None):
+    def run_cmd_generic(self, cmd_args, cwd=None, show_window=False):
         """通用的命令行执行方法 (用于 git 和 pip)"""
         target_cwd = cwd if cwd else self.full_path
-        return self.app.run_cmd(cmd_args, target_cwd)
+        return self.app.run_cmd(cmd_args, target_cwd, show_window)
 
     def run_git(self, args):
         cmd = [self.app.git_exe] + args
@@ -70,7 +70,8 @@ class GitItemBase:
         cmd = [python_exe, "-m", "pip", "install", "-r", "requirements.txt"]
         
         # pip 可能需要较长时间，这里返回的是 subprocess 的结果
-        code, out, err = self.run_cmd_generic(cmd)
+        # 传递 show_window=True 以显示终端窗口
+        code, out, err = self.run_cmd_generic(cmd, show_window=True)
         if code == 0:
             return True, out
         else:
@@ -188,6 +189,10 @@ class PluginRow(GitItemBase):
         self.btn_pip = tk.Button(self.frame, text="安装依赖", command=self.on_pip_click, bg="#e3f2fd", state="disabled", width=8)
         self.btn_pip.pack(side="right", padx=5)
 
+        # 6. 删除插件按钮
+        self.btn_delete = tk.Button(self.frame, text="删除", command=self.on_delete_click, bg="#ffcdd2", fg="#c62828", width=6)
+        self.btn_delete.pack(side="right", padx=5)
+
         threading.Thread(target=self.init_data, daemon=True).start()
 
     def init_data(self):
@@ -250,6 +255,36 @@ class PluginRow(GitItemBase):
                 messagebox.showerror("Pip 安装失败", f"{self.display_name} 依赖安装出错。\n\n错误信息:\n{msg}")
         self.app.root.after(0, post_ui)
 
+    def on_delete_click(self):
+        """删除插件按钮点击事件"""
+        if messagebox.askyesno("确认删除", f"确定要删除插件【{self.display_name}】吗？\n\n此操作不可恢复！"):
+            self.btn_delete.config(state="disabled", text="删除中...")
+            threading.Thread(target=self.do_delete, daemon=True).start()
+
+    def do_delete(self):
+        """执行删除操作"""
+        import shutil
+        try:
+            if os.path.exists(self.full_path):
+                shutil.rmtree(self.full_path)
+                success = True
+                msg = "删除成功"
+            else:
+                success = False
+                msg = "文件夹不存在"
+        except Exception as e:
+            success = False
+            msg = str(e)
+        
+        def post_ui():
+            if success:
+                self.frame.destroy()
+                messagebox.showinfo("删除成功", f"插件【{self.display_name}】已删除。")
+            else:
+                self.btn_delete.config(state="normal", text="删除")
+                messagebox.showerror("删除失败", f"删除插件失败:\n{msg}")
+        self.app.root.after(0, post_ui)
+
 # --- ComfyUI 本体管理 UI ---
 class CoreManagerFrame(tk.Frame, GitItemBase):
     def __init__(self, parent, app):
@@ -295,6 +330,18 @@ class CoreManagerFrame(tk.Frame, GitItemBase):
         self.btn_core_pip = tk.Button(row2, text="安装/修复依赖 (pip install -r requirements.txt)", command=self.on_core_pip, state="disabled")
         self.btn_core_pip.pack(side="left")
 
+        # 版本更新记录区域 (新增)
+        log_frame = tk.LabelFrame(self, text="版本更新记录 (Commit 历史)", padx=10, pady=10)
+        log_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        # 创建文本框和滚动条
+        self.commit_log_text = tk.Text(log_frame, wrap=tk.WORD, state="disabled", height=15)
+        self.commit_log_text.pack(side="left", fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(log_frame, command=self.commit_log_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.commit_log_text.config(yscrollcommand=scrollbar.set)
+
     def set_path(self, path):
         self.full_path = path
         self.lbl_path.config(text=f"位置: {path}")
@@ -312,6 +359,9 @@ class CoreManagerFrame(tk.Frame, GitItemBase):
         _, current_commit, _ = self.run_git(["log", "-1", "--format=%h - %s (%cd)", "--date=short"])
         versions = self.fetch_versions_base()
         has_req = self.check_requirements()
+        
+        # 获取版本更新记录（本地与远程的差异）
+        commit_log = self._fetch_commit_log()
 
         def update_ui():
             self.lbl_status_large.config(text=text, fg=color)
@@ -324,8 +374,48 @@ class CoreManagerFrame(tk.Frame, GitItemBase):
                 self.btn_core_pip.config(state="normal")
             else:
                 self.btn_core_pip.config(state="disabled", text="根目录无 requirements.txt")
+            
+            # 更新Commit日志显示
+            self._update_commit_log(commit_log)
         
         self.app.root.after(0, update_ui)
+
+    def _fetch_commit_log(self):
+        """获取本地与远程之间的Commit差异日志"""
+        try:
+            # 获取当前分支名
+            code, branch_name, _ = self.run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+            if code != 0 or not branch_name:
+                branch_name = "master"
+            
+            # 获取本地与远程的差异Commit（即将更新的内容）
+            code, ahead_log, _ = self.run_git(["log", f"HEAD..origin/{branch_name}", 
+                                               "--pretty=format:[%h] %s (%cd) - %an", "--date=short"])
+            
+            log_content = ""
+            if code == 0 and ahead_log.strip():
+                log_content += f"═══ 待更新内容 (共{ahead_log.count(chr(10))+1}条) ═══\n{ahead_log}\n\n"
+            
+            # 获取最近的Commit历史（本地已安装的）
+            code, recent_log, _ = self.run_git(["log", "-20", 
+                                                "--pretty=format:[%h] %s (%cd) - %an", "--date=short"])
+            if code == 0 and recent_log.strip():
+                if log_content:
+                    log_content += "═══ 最近已安装的版本 ═══\n"
+                else:
+                    log_content += "═══ 最近版本历史 ═══\n"
+                log_content += recent_log
+            
+            return log_content if log_content else "暂无版本记录"
+        except Exception as e:
+            return f"获取日志失败: {str(e)}"
+
+    def _update_commit_log(self, content):
+        """更新Commit日志文本框内容"""
+        self.commit_log_text.config(state="normal")
+        self.commit_log_text.delete(1.0, tk.END)
+        self.commit_log_text.insert(1.0, content)
+        self.commit_log_text.config(state="disabled")
 
     def on_execute(self):
         selection = self.var_version.get()
@@ -551,11 +641,18 @@ class ComfyUpdaterApp:
             if update_ui: # 避免初始化时弹窗
                 pass 
 
-    def run_cmd(self, cmd_args, cwd):
-        """执行命令，统一处理代理和环境"""
+    def run_cmd(self, cmd_args, cwd, show_window=False):
+        """执行命令，统一处理代理和环境
+        
+        Args:
+            cmd_args: 命令参数列表
+            cwd: 工作目录
+            show_window: 是否显示终端窗口（用于pip安装等需要用户查看进度的操作）
+        """
         try:
             startupinfo = None
-            if os.name == 'nt':
+            # 默认隐藏窗口，但show_window=True时显示（用于pip安装）
+            if os.name == 'nt' and not show_window:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
