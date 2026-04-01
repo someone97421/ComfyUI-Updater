@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox, ttk
 import subprocess
 import threading
 import configparser
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 # 配置文件名
@@ -58,7 +59,7 @@ class GitItemBase:
         return self.run_cmd_generic(cmd)
     
     def run_pip_install(self):
-        """执行 pip install -r requirements.txt"""
+        """执行 pip install -r requirements.txt，弹出终端窗口并在完成后暂停"""
         if not self.has_requirements:
             return False, "未找到 requirements.txt"
         
@@ -67,15 +68,65 @@ class GitItemBase:
         if not python_exe:
             return False, "未配置 Python 路径"
 
-        cmd = [python_exe, "-m", "pip", "install", "-r", "requirements.txt"]
+        req_path = os.path.join(self.full_path, "requirements.txt")
         
-        # pip 可能需要较长时间，这里返回的是 subprocess 的结果
-        # 传递 show_window=True 以显示终端窗口
-        code, out, err = self.run_cmd_generic(cmd, show_window=True)
-        if code == 0:
-            return True, out
-        else:
-            return False, f"{err}\n{out}"
+        # 构建环境变量
+        env = os.environ.copy()
+        proxy_url = self.app.proxy_url
+        env_lines = ""
+        if proxy_url:
+            env_lines = f'set "http_proxy={proxy_url}"\nset "https_proxy={proxy_url}"\n'
+
+        # 创建临时 bat 脚本：执行 pip install 并在结束后暂停
+        bat_content = f'''@echo off
+chcp 65001 >nul
+echo ============================================
+echo   安装依赖: {self.display_name}
+echo ============================================
+echo.
+{env_lines}"{python_exe}" -m pip install -r "{req_path}"
+echo.
+if %errorlevel% equ 0 (
+    echo ============================================
+    echo   依赖安装完成！
+    echo ============================================
+) else (
+    echo ============================================
+    echo   依赖安装出错，请检查上方错误信息
+    echo ============================================
+)
+echo.
+pause
+'''
+        try:
+            # 写入临时 bat 文件
+            fd, bat_path = tempfile.mkstemp(suffix='.bat', prefix='comfy_pip_')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(bat_content)
+            
+            # 使用 CREATE_NEW_CONSOLE 弹出新终端窗口
+            CREATE_NEW_CONSOLE = 0x00000010
+            process = subprocess.Popen(
+                ['cmd', '/c', bat_path],
+                cwd=self.full_path,
+                creationflags=CREATE_NEW_CONSOLE,
+                env=env
+            )
+            # 等待终端窗口关闭（用户按任意键后）
+            process.wait()
+            
+            # 清理临时文件
+            try:
+                os.remove(bat_path)
+            except:
+                pass
+            
+            if process.returncode == 0:
+                return True, "依赖安装完成"
+            else:
+                return False, f"pip 安装返回错误码: {process.returncode}"
+        except Exception as e:
+            return False, str(e)
 
     def check_status_base(self):
         if not os.path.exists(os.path.join(self.full_path, ".git")):
