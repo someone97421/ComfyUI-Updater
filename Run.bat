@@ -1,53 +1,42 @@
 @echo off
-setlocal enabledelayedexpansion
-
-:: 切换编码防止乱码
+setlocal DisableDelayedExpansion
 chcp 65001 >nul
+cd /d "%~dp0"
 
-:: 设置配置文件名
-set CONFIG_FILE=config.ini
-set SCRIPT_FILE=main.py
-
-:: 检查配置文件是否存在
-if not exist "%CONFIG_FILE%" (
-    echo [Error] 找不到 %CONFIG_FILE%
-    echo 请确保配置文件存在。
-    pause
-    exit /b
-)
-
-:: 从 config.ini 中读取 python_path
-:: 逻辑：寻找以 python_path 开头的行，提取等号后的内容
 set "PYTHON_EXE="
-for /f "tokens=1,* delims==" %%A in ('type "%CONFIG_FILE%" ^| findstr /i "^python_path"') do (
-    set "KEY=%%A"
-    set "VAL=%%B"
-    :: 去除空格
-    set "VAL=!VAL: =!"
-    set "PYTHON_EXE=!VAL!"
-)
+if exist "config.ini" for /f "tokens=1,* delims==" %%A in ('findstr /i /b "python_path" "config.ini"') do set "PYTHON_EXE=%%B"
+if defined PYTHON_EXE for /f "tokens=*" %%A in ("%PYTHON_EXE%") do set "PYTHON_EXE=%%A"
+if defined PYTHON_EXE goto configured
 
-:: 如果没读取到
-if "%PYTHON_EXE%"=="" (
-    echo [Error] 无法在 %CONFIG_FILE% 中找到 python_path 设置
-    pause
-    exit /b
-)
+where py >nul 2>&1
+if not errorlevel 1 goto launcher
+where python >nul 2>&1
+if not errorlevel 1 goto system_python
+if exist "..\..\python_embeded\python.exe" goto embedded
 
-:: 检查 Python 是否存在 (处理相对路径)
-if not exist "%PYTHON_EXE%" (
-    echo [Warning] 配置的路径 "%PYTHON_EXE%" 似乎不存在。
-    echo 尝试直接运行...
-)
+echo 未找到 Python。请安装带有 Tkinter 的 Python，或在 config.ini 中设置 python_path。
+pause
+exit /b 1
 
-echo 使用 Python: %PYTHON_EXE%
-echo running...
+:configured
+"%PYTHON_EXE%" "%~dp0main.py"
+goto finished
 
-:: 启动 Python 脚本
-"%PYTHON_EXE%" "%SCRIPT_FILE%"
+:launcher
+py -3 "%~dp0main.py"
+goto finished
 
-if %errorlevel% neq 0 (
-    echo Error
-    pause
+:system_python
+python "%~dp0main.py"
+goto finished
 
-)
+:embedded
+"..\..\python_embeded\python.exe" "%~dp0main.py"
+
+:finished
+set "RESULT=%ERRORLEVEL%"
+if "%RESULT%"=="0" exit /b 0
+echo.
+echo 启动或运行失败，请查看上方错误。如果提示缺少 tkinter，请使用带有 Tkinter 的 Python 启动 main.py。
+pause
+exit /b %RESULT%

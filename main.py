@@ -1,763 +1,510 @@
-import os
-import sys
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import subprocess
-import threading
 import configparser
-import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import os
+import queue
+import sys
+import threading
+import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
-# 配置文件名
-CONFIG_FILE = "config.ini"
+# 便携版 Python 的 _pth 配置可能不包含脚本目录。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from operations import LATEST, Operations
 
-# --- 辅助类：滚动框架 (保持不变) ---
-class ScrollableFrame(ttk.Frame):
-    def __init__(self, container, *args, **kwargs):
-        super().__init__(container, *args, **kwargs)
-        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
-
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-
-# --- 核心类：Git 操作及依赖管理基类 ---
-class GitItemBase:
-    def __init__(self, app, path, display_name):
-        self.app = app
-        self.full_path = path
-        self.display_name = display_name
-        self.is_update_available = False
-        self.has_requirements = False
-
-    def check_requirements(self):
-        """检查是否存在 requirements.txt"""
-        req_path = os.path.join(self.full_path, "requirements.txt")
-        self.has_requirements = os.path.exists(req_path)
-        return self.has_requirements
-
-    def run_cmd_generic(self, cmd_args, cwd=None, show_window=False):
-        """通用的命令行执行方法 (用于 git 和 pip)"""
-        target_cwd = cwd if cwd else self.full_path
-        return self.app.run_cmd(cmd_args, target_cwd, show_window)
-
-    def run_git(self, args):
-        cmd = [self.app.git_exe] + args
-        return self.run_cmd_generic(cmd)
-    
-    def run_pip_install(self):
-        """执行 pip install -r requirements.txt，弹出终端窗口并在完成后暂停"""
-        if not self.has_requirements:
-            return False, "未找到 requirements.txt"
-        
-        # 使用配置中的 python 路径
-        python_exe = self.app.python_exe
-        if not python_exe:
-            return False, "未配置 Python 路径"
-
-        req_path = os.path.join(self.full_path, "requirements.txt")
-        
-        # 构建环境变量
-        env = os.environ.copy()
-        proxy_url = self.app.proxy_url
-        env_lines = ""
-        if proxy_url:
-            env_lines = f'set "http_proxy={proxy_url}"\nset "https_proxy={proxy_url}"\n'
-
-        # 创建临时 bat 脚本：执行 pip install 并在结束后暂停
-        bat_content = f'''@echo off
-chcp 65001 >nul
-echo ============================================
-echo   安装依赖: {self.display_name}
-echo ============================================
-echo.
-{env_lines}"{python_exe}" -m pip install -r "{req_path}"
-echo.
-if %errorlevel% equ 0 (
-    echo ============================================
-    echo   依赖安装完成！
-    echo ============================================
-) else (
-    echo ============================================
-    echo   依赖安装出错，请检查上方错误信息
-    echo ============================================
-)
-echo.
-pause
-'''
-        try:
-            # 写入临时 bat 文件
-            fd, bat_path = tempfile.mkstemp(suffix='.bat', prefix='comfy_pip_')
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(bat_content)
-            
-            # 使用 CREATE_NEW_CONSOLE 弹出新终端窗口
-            CREATE_NEW_CONSOLE = 0x00000010
-            process = subprocess.Popen(
-                ['cmd', '/c', bat_path],
-                cwd=self.full_path,
-                creationflags=CREATE_NEW_CONSOLE,
-                env=env
-            )
-            # 等待终端窗口关闭（用户按任意键后）
-            process.wait()
-            
-            # 清理临时文件
-            try:
-                os.remove(bat_path)
-            except:
-                pass
-            
-            if process.returncode == 0:
-                return True, "依赖安装完成"
-            else:
-                return False, f"pip 安装返回错误码: {process.returncode}"
-        except Exception as e:
-            return False, str(e)
-
-    def check_status_base(self):
-        if not os.path.exists(os.path.join(self.full_path, ".git")):
-            return "非Git仓库", "gray", False
-        
-        self.run_git(["fetch"]) 
-        code, out, _ = self.run_git(["status", "-uno"])
-        
-        if "behind" in out or "落后" in out:
-            return "检测到新版本", "red", True
-        elif "detached" in out:
-             return "处于历史版本", "orange", False
-        
-        return "最新版本", "green", False
-
-    def fetch_versions_base(self):
-        versions = ["最新版本 (Latest)"]
-        if not os.path.exists(os.path.join(self.full_path, ".git")):
-            return []
-        
-        # Tags
-        code, out, _ = self.run_git(["tag", "--sort=-creatordate"])
-        if code == 0 and out:
-            tags = out.split('\n')[:8]
-            for t in tags:
-                if t.strip(): versions.append(f"Tag: {t.strip()}")
-
-        # Commits
-        code, out, _ = self.run_git(["log", "--pretty=format:%h - %s", "-n", "15"])
-        if code == 0 and out:
-            commits = out.split('\n')
-            for c in commits:
-                if c.strip(): versions.append(f"Commit: {c.strip()}")
-        return versions
-
-    def do_update_logic(self, selection, silent=False):
-        try:
-            def try_force_reset(err_msg):
-                keywords = ["overwritten by merge", "stash them", "local changes", "aborted"]
-                if any(k in err_msg for k in keywords):
-                    if messagebox.askyesno("冲突解决", 
-                        f"检测到 {self.display_name} 有本地修改导致更新失败。\n\n是否【丢弃本地修改】并强制更新？"):
-                        r_code, _, r_err = self.run_git(["reset", "--hard", "HEAD"])
-                        return r_code == 0
-                return False
-
-            if "最新版本" in selection:
-                code, out, _ = self.run_git(["remote", "show", "origin"])
-                head_branch = "master" 
-                if "HEAD branch" in out:
-                    for line in out.splitlines():
-                        if "HEAD branch" in line:
-                            head_branch = line.split(":")[-1].strip()
-                            break
-                
-                self.run_git(["checkout", head_branch])
-                code, out, err = self.run_git(["pull"])
-                if code != 0:
-                    if try_force_reset(err):
-                        code, out, err = self.run_git(["pull"])
-
-                if code == 0:
-                    return True, "更新成功"
-                else:
-                    return False, f"更新失败: {err}"
-
-            elif "Tag:" in selection or "Commit:" in selection:
-                target = selection.replace("Tag: ", "").strip() if "Tag:" in selection else selection.split(" ")[1].strip()
-                code, _, err = self.run_git(["checkout", target])
-                if code != 0:
-                    if try_force_reset(err):
-                        code, _, err = self.run_git(["checkout", target])
-                
-                if code == 0:
-                    return True, f"已回退: {target}"
-                else:
-                    return False, f"切换失败: {err}"
-            return False, "未选择操作"
-
-        except Exception as e:
-            return False, str(e)
-
-# --- 插件行UI (继承自 GitItemBase) ---
-class PluginRow(GitItemBase):
-    def __init__(self, parent_frame, app, folder_name):
-        full_path = os.path.join(app.nodes_path, folder_name)
-        super().__init__(app, full_path, folder_name)
-        
-        self.frame = tk.Frame(parent_frame, bd=1, relief=tk.RIDGE, bg="white")
-        self.frame.pack(fill="x", pady=2, padx=5)
-        
-        # 1. 名字
-        self.lbl_name = tk.Label(self.frame, text=folder_name, width=28, anchor="w", font=("Arial", 9, "bold"), bg="white")
-        self.lbl_name.pack(side="left", padx=5)
-
-        # 2. 状态
-        self.lbl_status = tk.Label(self.frame, text="等待检查...", width=12, fg="gray", bg="white")
-        self.lbl_status.pack(side="left", padx=5)
-
-        # 3. 版本下拉
-        self.var_version = tk.StringVar()
-        self.combo_versions = ttk.Combobox(self.frame, textvariable=self.var_version, width=25, state="readonly")
-        self.combo_versions.set("加载中...")
-        self.combo_versions.pack(side="left", padx=5)
-
-        # 4. 执行操作按钮
-        self.btn_action = tk.Button(self.frame, text="执行操作", command=self.on_action_click, bg="#f0f0f0", state="disabled", width=8)
-        self.btn_action.pack(side="left", padx=5)
-
-        # 5. 依赖修复按钮 (新增)
-        self.btn_pip = tk.Button(self.frame, text="安装依赖", command=self.on_pip_click, bg="#e3f2fd", state="disabled", width=8)
-        self.btn_pip.pack(side="right", padx=5)
-
-        # 6. 删除插件按钮
-        self.btn_delete = tk.Button(self.frame, text="删除", command=self.on_delete_click, bg="#ffcdd2", fg="#c62828", width=6)
-        self.btn_delete.pack(side="right", padx=5)
-
-        threading.Thread(target=self.init_data, daemon=True).start()
-
-    def init_data(self):
-        text, color, is_update = self.check_status_base()
-        self.is_update_available = is_update
-        
-        # 检查依赖文件
-        has_req = self.check_requirements()
-
-        versions = self.fetch_versions_base()
-
-        def update_ui():
-            self.lbl_status.config(text=text, fg=color)
-            self._update_combo(versions)
-            if has_req:
-                self.btn_pip.config(state="normal")
-            else:
-                self.btn_pip.config(state="disabled", text="无依赖")
-
-        self.app.root.after(0, update_ui)
-
-    def _update_combo(self, versions):
-        self.combo_versions['values'] = versions
-        if versions: self.combo_versions.current(0)
-        else: self.combo_versions.set("无版本记录")
-        self.btn_action.config(state="normal")
-
-    def on_action_click(self):
-        selection = self.var_version.get()
-        if not selection: return
-        if messagebox.askyesno("确认", f"对插件 {self.display_name} 执行:\n{selection}?"):
-            self.btn_action.config(state="disabled", text="执行中...")
-            threading.Thread(target=self.do_update, args=(selection, False), daemon=True).start()
-
-    def do_update(self, selection, silent=False):
-        success, msg = self.do_update_logic(selection, silent)
-        def post_ui():
-            self.btn_action.config(state="normal", text="执行操作")
-            if success:
-                self.lbl_status.config(text="操作成功", fg="green")
-                self.is_update_available = False
-                if not silent: messagebox.showinfo("成功", f"{self.display_name}: {msg}")
-            else:
-                self.lbl_status.config(text="操作失败", fg="red")
-                if not silent: messagebox.showerror("失败", f"{self.display_name}: {msg}")
-        self.app.root.after(0, post_ui)
-    
-    def on_pip_click(self):
-        if messagebox.askyesno("安装依赖", f"即将为 {self.display_name} 执行 pip install。\n请确保网络通畅（代理已配置）。\n\n继续吗？"):
-            self.btn_pip.config(state="disabled", text="安装中...")
-            threading.Thread(target=self.do_pip, daemon=True).start()
-
-    def do_pip(self):
-        success, msg = self.run_pip_install()
-        def post_ui():
-            self.btn_pip.config(state="normal", text="安装依赖")
-            if success:
-                messagebox.showinfo("Pip 安装成功", f"{self.display_name} 依赖安装完成。\n\n日志片段:\n{msg[-500:]}")
-            else:
-                messagebox.showerror("Pip 安装失败", f"{self.display_name} 依赖安装出错。\n\n错误信息:\n{msg}")
-        self.app.root.after(0, post_ui)
-
-    def on_delete_click(self):
-        """删除插件按钮点击事件"""
-        if messagebox.askyesno("确认删除", f"确定要删除插件【{self.display_name}】吗？\n\n此操作不可恢复！"):
-            self.btn_delete.config(state="disabled", text="删除中...")
-            threading.Thread(target=self.do_delete, daemon=True).start()
-
-    def do_delete(self):
-        """执行删除操作"""
-        import shutil
-        try:
-            if os.path.exists(self.full_path):
-                shutil.rmtree(self.full_path)
-                success = True
-                msg = "删除成功"
-            else:
-                success = False
-                msg = "文件夹不存在"
-        except Exception as e:
-            success = False
-            msg = str(e)
-        
-        def post_ui():
-            if success:
-                self.frame.destroy()
-                messagebox.showinfo("删除成功", f"插件【{self.display_name}】已删除。")
-            else:
-                self.btn_delete.config(state="normal", text="删除")
-                messagebox.showerror("删除失败", f"删除插件失败:\n{msg}")
-        self.app.root.after(0, post_ui)
-
-# --- ComfyUI 本体管理 UI ---
-class CoreManagerFrame(tk.Frame, GitItemBase):
-    def __init__(self, parent, app):
-        tk.Frame.__init__(self, parent)
-        self.app = app
-        GitItemBase.__init__(self, app, "", "ComfyUI 本体")
-        
-        self.create_widgets()
-    
-    def create_widgets(self):
-        tk.Label(self, text="ComfyUI 本体版本管理", font=("Arial", 14, "bold"), pady=10).pack()
-        self.lbl_path = tk.Label(self, text="当前路径: 未设置", fg="gray")
-        self.lbl_path.pack()
-
-        # 状态显示
-        status_frame = tk.LabelFrame(self, text="当前状态", padx=20, pady=20)
-        status_frame.pack(fill="x", padx=20, pady=10)
-        self.lbl_status_large = tk.Label(status_frame, text="未知", font=("Arial", 12))
-        self.lbl_status_large.pack()
-        self.lbl_commit_info = tk.Label(status_frame, text="", fg="#555")
-        self.lbl_commit_info.pack(pady=5)
-
-        # 操作区域
-        action_frame = tk.LabelFrame(self, text="维护操作", padx=20, pady=20)
-        action_frame.pack(fill="x", padx=20, pady=10)
-
-        # 版本更新行
-        row1 = tk.Frame(action_frame)
-        row1.pack(fill="x", pady=5)
-        tk.Label(row1, text="版本切换: ").pack(side="left")
-        self.var_version = tk.StringVar()
-        self.combo_versions = ttk.Combobox(row1, textvariable=self.var_version, width=40, state="readonly")
-        self.combo_versions.pack(side="left", padx=5)
-        self.btn_check = tk.Button(row1, text="刷新/检查", command=self.refresh_data)
-        self.btn_check.pack(side="left", padx=5)
-        self.btn_execute = tk.Button(row1, text="执行更新/回退", bg="#c8e6c9", command=self.on_execute)
-        self.btn_execute.pack(side="left", padx=5)
-
-        # 依赖修复行
-        row2 = tk.Frame(action_frame)
-        row2.pack(fill="x", pady=15)
-        tk.Label(row2, text="环境维护: ").pack(side="left")
-        self.btn_core_pip = tk.Button(row2, text="安装/修复依赖 (pip install -r requirements.txt)", command=self.on_core_pip, state="disabled")
-        self.btn_core_pip.pack(side="left")
-
-        # 版本更新记录区域 (新增)
-        log_frame = tk.LabelFrame(self, text="版本更新记录 (Commit 历史)", padx=10, pady=10)
-        log_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        # 创建文本框和滚动条
-        self.commit_log_text = tk.Text(log_frame, wrap=tk.WORD, state="disabled", height=15)
-        self.commit_log_text.pack(side="left", fill="both", expand=True)
-        
-        scrollbar = ttk.Scrollbar(log_frame, command=self.commit_log_text.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.commit_log_text.config(yscrollcommand=scrollbar.set)
-
-    def set_path(self, path):
-        self.full_path = path
-        self.lbl_path.config(text=f"位置: {path}")
-        self.refresh_data()
-
-    def refresh_data(self):
-        if not self.full_path or not os.path.exists(self.full_path):
-            return
-        
-        self.btn_check.config(state="disabled")
-        threading.Thread(target=self._async_check, daemon=True).start()
-
-    def _async_check(self):
-        text, color, is_update = self.check_status_base()
-        _, current_commit, _ = self.run_git(["log", "-1", "--format=%h - %s (%cd)", "--date=short"])
-        versions = self.fetch_versions_base()
-        has_req = self.check_requirements()
-        
-        # 获取版本更新记录（本地与远程的差异）
-        commit_log = self._fetch_commit_log()
-
-        def update_ui():
-            self.lbl_status_large.config(text=text, fg=color)
-            self.lbl_commit_info.config(text=f"当前Commit: {current_commit}")
-            self.combo_versions['values'] = versions
-            if versions: self.combo_versions.current(0)
-            self.btn_check.config(state="normal")
-            
-            if has_req:
-                self.btn_core_pip.config(state="normal")
-            else:
-                self.btn_core_pip.config(state="disabled", text="根目录无 requirements.txt")
-            
-            # 更新Commit日志显示
-            self._update_commit_log(commit_log)
-        
-        self.app.root.after(0, update_ui)
-
-    def _fetch_commit_log(self):
-        """获取本地与远程之间的Commit差异日志"""
-        try:
-            # 获取当前分支名
-            code, branch_name, _ = self.run_git(["rev-parse", "--abbrev-ref", "HEAD"])
-            if code != 0 or not branch_name:
-                branch_name = "master"
-            
-            # 获取本地与远程的差异Commit（即将更新的内容）
-            code, ahead_log, _ = self.run_git(["log", f"HEAD..origin/{branch_name}", 
-                                               "--pretty=format:[%h] %s (%cd) - %an", "--date=short"])
-            
-            log_content = ""
-            if code == 0 and ahead_log.strip():
-                log_content += f"═══ 待更新内容 (共{ahead_log.count(chr(10))+1}条) ═══\n{ahead_log}\n\n"
-            
-            # 获取最近的Commit历史（本地已安装的）
-            code, recent_log, _ = self.run_git(["log", "-20", 
-                                                "--pretty=format:[%h] %s (%cd) - %an", "--date=short"])
-            if code == 0 and recent_log.strip():
-                if log_content:
-                    log_content += "═══ 最近已安装的版本 ═══\n"
-                else:
-                    log_content += "═══ 最近版本历史 ═══\n"
-                log_content += recent_log
-            
-            return log_content if log_content else "暂无版本记录"
-        except Exception as e:
-            return f"获取日志失败: {str(e)}"
-
-    def _update_commit_log(self, content):
-        """更新Commit日志文本框内容"""
-        self.commit_log_text.config(state="normal")
-        self.commit_log_text.delete(1.0, tk.END)
-        self.commit_log_text.insert(1.0, content)
-        self.commit_log_text.config(state="disabled")
-
-    def on_execute(self):
-        selection = self.var_version.get()
-        if not selection: return
-        if messagebox.askyesno("风险提示", f"即将对 ComfyUI 本体执行:\n{selection}\n\n注意：如果要更新本体，最好先备份。确定继续吗？"):
-            self.btn_execute.config(state="disabled", text="执行中...")
-            threading.Thread(target=self._async_execute, args=(selection,), daemon=True).start()
-
-    def _async_execute(self, selection):
-        success, msg = self.do_update_logic(selection)
-        def post():
-            self.btn_execute.config(state="normal", text="执行更新/回退")
-            if success:
-                messagebox.showinfo("成功", f"本体操作完成: {msg}")
-                self.refresh_data()
-            else:
-                messagebox.showerror("失败", msg)
-        self.app.root.after(0, post)
-
-    def on_core_pip(self):
-        if messagebox.askyesno("依赖修复", "即将对 ComfyUI 根目录执行 pip install -r requirements.txt。\n\n这可能需要一些时间，请耐心等待。"):
-            self.btn_core_pip.config(state="disabled", text="安装中...")
-            threading.Thread(target=self._async_pip, daemon=True).start()
-
-    def _async_pip(self):
-        success, msg = self.run_pip_install()
-        def post():
-            self.btn_core_pip.config(state="normal", text="安装/修复依赖")
-            if success:
-                messagebox.showinfo("成功", "本体依赖安装完成。")
-            else:
-                messagebox.showerror("失败", f"安装出错:\n{msg}")
-        self.app.root.after(0, post)
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = BASE_DIR / "config.ini"
 
 
-# --- 主程序类 ---
 class ComfyUpdaterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ComfyUI 版本管理器 👻CK👻 (Pro)")
-        self.root.geometry("1150x800")
-
-        self.config = configparser.ConfigParser()
-        
-        # 默认值
-        self.git_exe = "git"
-        self.python_exe = "python"
-        self.comfyui_root = ""
-        self.nodes_path = ""
-        self.proxy_url = "" 
-        
-        self.plugin_rows = []
-        
-        # 加载配置
-        self.load_config()
-
-        # 1. 顶部设置面板 (重写，支持输入框和选择)
-        self.setup_settings_ui()
-
-        # 2. 选项卡
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Tab 1: 插件管理
-        self.tab_plugins = tk.Frame(self.notebook)
-        self.notebook.add(self.tab_plugins, text=" 🧩 插件管理 (Custom Nodes) ")
-        
-        plugin_toolbar = tk.Frame(self.tab_plugins)
-        plugin_toolbar.pack(fill="x", pady=5)
-        tk.Button(plugin_toolbar, text="刷新列表", command=self.refresh_plugin_list).pack(side="right", padx=5)
-        self.btn_update_all = tk.Button(plugin_toolbar, text="一键更新所有插件", command=self.update_all_plugins, bg="#c8e6c9")
-        self.btn_update_all.pack(side="right", padx=5)
-
-        self.list_container = ScrollableFrame(self.tab_plugins)
-        self.list_container.pack(fill="both", expand=True, padx=10, pady=5)
-
-        # Tab 2: 本体管理
-        self.tab_core = tk.Frame(self.notebook)
-        self.notebook.add(self.tab_core, text=" ⚙️ ComfyUI 本体管理 ")
-        
-        self.core_manager = CoreManagerFrame(self.tab_core, self)
-        self.core_manager.pack(fill="both", expand=True)
-
-        # 3. 底部状态栏
-        self.status_bar = tk.Label(root, text="就绪", bd=1, relief=tk.SUNKEN, anchor="w")
-        self.status_bar.pack(side="bottom", fill="x")
-
-        # 初始化路径检查
-        if self.comfyui_root:
-            self.set_root_path(self.comfyui_root, update_ui=False)
-        self.update_status_bar()
-
-    def setup_settings_ui(self):
-        """创建顶部的设置区域"""
-        top_frame = tk.LabelFrame(self.root, text="全局设置 (修改后自动保存)", padx=5, pady=5, bg="#f5f5f5")
-        top_frame.pack(fill="x", padx=5, pady=5)
-
-        # Grid 布局
-        # Row 0: ComfyUI 目录
-        tk.Label(top_frame, text="ComfyUI 根目录:", bg="#f5f5f5").grid(row=0, column=0, sticky="e", padx=5)
-        self.entry_root = tk.Entry(top_frame, width=80)
-        self.entry_root.insert(0, self.comfyui_root)
-        self.entry_root.grid(row=0, column=1, padx=5, pady=2)
-        tk.Button(top_frame, text="浏览...", command=self.browse_root).grid(row=0, column=2, padx=5)
-
-        # Row 1: Python 路径
-        tk.Label(top_frame, text="Python 路径:", bg="#f5f5f5").grid(row=1, column=0, sticky="e", padx=5)
-        self.entry_python = tk.Entry(top_frame, width=80)
-        self.entry_python.insert(0, self.python_exe)
-        self.entry_python.grid(row=1, column=1, padx=5, pady=2)
-        tk.Button(top_frame, text="选择文件...", command=self.browse_python).grid(row=1, column=2, padx=5)
-
-        # Row 2: Git 路径
-        tk.Label(top_frame, text="Git 路径:", bg="#f5f5f5").grid(row=2, column=0, sticky="e", padx=5)
-        self.entry_git = tk.Entry(top_frame, width=80)
-        self.entry_git.insert(0, self.git_exe)
-        self.entry_git.grid(row=2, column=1, padx=5, pady=2)
-        tk.Button(top_frame, text="选择文件...", command=self.browse_git).grid(row=2, column=2, padx=5)
-
-        # Row 3: 代理
-        tk.Label(top_frame, text="HTTP代理 (Git/Pip):", bg="#f5f5f5").grid(row=3, column=0, sticky="e", padx=5)
-        self.entry_proxy = tk.Entry(top_frame, width=80)
-        self.entry_proxy.insert(0, self.proxy_url)
-        self.entry_proxy.grid(row=3, column=1, padx=5, pady=2)
-        tk.Button(top_frame, text="应用配置", bg="#ffecb3", command=self.apply_config_from_ui).grid(row=3, column=2, padx=5)
-
-    def load_config(self):
-        if not os.path.exists(CONFIG_FILE): return
+        root.title("ComfyUI 版本管理器 · CK")
+        root.geometry("760x560")
+        root.minsize(700, 480)
+        self.events = queue.Queue()
+        self.busy = False
+        self.items = {}
+        self.visible_ids = {}
+        self.config = configparser.ConfigParser(interpolation=None)
+        self.config_error = ""
         try:
-            self.config.read(CONFIG_FILE, encoding='utf-8')
-            if 'Settings' in self.config:
-                self.git_exe = self.config['Settings'].get('git_path', 'git').strip()
-                self.python_exe = self.config['Settings'].get('python_path', 'python').strip()
-                
-                p = self.config['Settings'].get('comfyui_root_path', '').strip()
-                if p:
-                    # 如果是相对路径，转为绝对路径
-                    if not os.path.isabs(p):
-                        p = os.path.abspath(os.path.join(os.getcwd(), p))
-                    self.comfyui_root = p
-            
-            if 'Network' in self.config:
-                self.proxy_url = self.config['Network'].get('https_proxy', '').strip()
-        except Exception as e:
-            print(f"Load config error: {e}")
+            self.config.read(CONFIG_FILE, encoding="utf-8-sig")
+        except (OSError, configparser.Error) as exc:
+            self.config_error = f"配置读取失败：{exc}"
+        settings = self.config["Settings"] if self.config.has_section("Settings") else {}
+        network = self.config["Network"] if self.config.has_section("Network") else {}
+        default_root = str(BASE_DIR.parent) if (BASE_DIR.parent / "custom_nodes").is_dir() else ""
+        self.root_var = tk.StringVar(value=settings.get("comfyui_root_path", default_root))
+        self.python_var = tk.StringVar(value=settings.get("python_path", sys.executable))
+        self.git_var = tk.StringVar(value=settings.get("git_path", "git"))
+        self.proxy_var = tk.StringVar(value=network.get("https_proxy", ""))
+        self.search_var = tk.StringVar()
+        self.filter_var = tk.StringVar(value="全部状态")
+        self.status_var = tk.StringVar(value="就绪")
+        self.summary_var = tk.StringVar()
+        self.detail_var = tk.StringVar(value="选择插件查看版本与操作")
+        self.version_var = tk.StringVar()
+        self.setting_controls = []
+        self.operation_controls = []
+        self.comfy_root = self.resolve_path(self.root_var.get())
+        self.nodes_path = os.path.join(self.comfy_root, "custom_nodes") if self.comfy_root else ""
+        self.operations = self.make_operations()
+        self.build_ui()
+        self.search_var.trace_add("write", lambda *_: self.render_plugins())
+        self.filter_var.trace_add("write", lambda *_: self.render_plugins())
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.after(80, self.drain_events)
+        if self.config_error:
+            self.log(self.config_error)
+        if self.comfy_root:
+            self.refresh(check_remote=True)
 
-    def save_config(self):
-        """将当前内存中的变量写入 config.ini"""
-        if 'Settings' not in self.config: self.config['Settings'] = {}
-        if 'Network' not in self.config: self.config['Network'] = {}
+    def resolve_path(self, value):
+        value = os.path.expandvars(os.path.expanduser(value.strip().strip('"')))
+        if not value:
+            return ""
+        return os.path.abspath(os.path.join(str(BASE_DIR), value))
 
-        self.config['Settings']['git_path'] = self.git_exe
-        self.config['Settings']['python_path'] = self.python_exe
-        
-        # 尝试存相对路径以便便携，如果不在同级目录则存绝对路径
+    def resolve_executable(self, value):
+        value = os.path.expandvars(os.path.expanduser(value.strip().strip('"')))
+        return self.resolve_path(value) if "/" in value or "\\" in value else value
+
+    def make_operations(self):
+        return Operations(self.resolve_executable(self.git_var.get()) or "git",
+                          self.resolve_executable(self.python_var.get()) or sys.executable,
+                          self.proxy_var.get().strip())
+
+    def build_ui(self):
+        style = ttk.Style(self.root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        style.configure("Treeview", rowheight=23, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("TButton", padding=(4, 2))
+        header = ttk.Frame(self.root, padding=(6, 4))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="ComfyUI 版本管理", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        settings_button = ttk.Button(header, text="环境设置", command=self.open_settings)
+        settings_button.pack(side="right")
+        self.setting_controls.append(settings_button)
+        self.settings_window = None
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=6)
+        plugins = ttk.Frame(self.notebook, padding=4)
+        core = ttk.Frame(self.notebook, padding=5)
+        self.notebook.add(plugins, text="插件管理")
+        self.notebook.add(core, text="ComfyUI 本体")
+        toolbar = ttk.Frame(plugins)
+        toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Label(toolbar, text="搜索").pack(side="left")
+        ttk.Entry(toolbar, textvariable=self.search_var, width=19).pack(side="left", padx=4)
+        ttk.Combobox(toolbar, textvariable=self.filter_var, state="readonly", width=10,
+                     values=("全部状态", "有更新", "检查失败", "非 Git 仓库")).pack(side="left")
+        for text, command in [("刷新", self.refresh), ("检查更新", self.check_updates),
+                              ("批量更新", self.update_all)]:
+            button = ttk.Button(toolbar, text=text, width=8, command=command)
+            button.pack(side="right", padx=(4, 0))
+            self.operation_controls.append(button)
+        table = ttk.Frame(plugins)
+        table.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table, columns=("name", "status", "commit", "req"),
+                                 height=10, show="headings", selectmode="browse")
+        for key, title, width in [("name", "插件", 235), ("status", "状态", 100),
+                                  ("commit", "提交", 200), ("req", "依赖", 46)]:
+            self.tree.heading(key, text=title, anchor="w")
+            self.tree.column(key, width=width, minwidth=width if key in ("status", "req") else 90,
+                             stretch=key in ("name", "commit"))
+        self.tree.tag_configure("update", foreground="#a45b00")
+        self.tree.tag_configure("error", foreground="#b42318")
+        self.tree.tag_configure("plain", foreground="#667085")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", lambda _: self.show_selected())
+        self.tree.bind("<Double-1>", lambda _: self.open_folder())
+        ttk.Label(plugins, textvariable=self.summary_var).pack(anchor="w", pady=(3, 0))
+
+        core_header = ttk.Frame(core)
+        core_header.pack(fill="x", pady=(0, 4))
+        self.core_label = ttk.Label(core_header, text="请设置 ComfyUI 根目录", wraplength=540)
+        self.core_label.pack(side="left", fill="x", expand=True)
+        core_check = ttk.Button(core_header, text="检查更新", width=8,
+                                command=lambda: self.check_updates(core_only=True))
+        core_check.pack(side="right", anchor="n")
+        self.operation_controls.append(core_check)
+        self.core_history = self.make_text(core, height=10)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _: self.show_selected())
+
+        detail = ttk.Frame(self.root, padding=(6, 4))
+        detail.grid(row=2, column=0, sticky="ew")
+        ttk.Label(detail, textvariable=self.detail_var, anchor="w").pack(fill="x")
+        actions = ttk.Frame(detail)
+        actions.pack(fill="x", pady=(3, 0))
+        self.versions = ttk.Combobox(actions, textvariable=self.version_var, state="disabled", width=22)
+        self.versions.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.execute_button = ttk.Button(actions, text="更新 / 切换", width=10, command=self.execute)
+        self.pip_button = ttk.Button(actions, text="安装依赖", width=8, command=self.install)
+        self.open_button = ttk.Button(actions, text="打开目录", width=8, command=self.open_folder)
+        self.delete_button = ttk.Button(actions, text="删除", width=5, command=self.delete)
+        for button in (self.execute_button, self.pip_button, self.open_button, self.delete_button):
+            button.pack(side="left", padx=(3, 0))
+        self.notes = ttk.Notebook(self.root)
+        self.notes.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 3))
+        self.history = self.add_text_tab("版本记录", height=4)
+        self.logs = self.add_text_tab("操作日志", height=4)
+        bottom = ttk.Frame(self.root, padding=(6, 2))
+        bottom.grid(row=4, column=0, sticky="ew")
+        self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=75)
+        self.progress.pack(side="right")
+        ttk.Label(bottom, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        self.show_selected()
+
+    def open_settings(self):
+        if self.settings_window is not None:
+            self.settings_window.deiconify()
+            self.settings_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self.settings_window = window
+        window.title("环境设置")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", window.withdraw)
+        settings = ttk.Frame(window, padding=8)
+        settings.pack(fill="both", expand=True)
+        fields = [("ComfyUI 目录", self.root_var, "directory"),
+                  ("Python", self.python_var, "file"),
+                  ("Git", self.git_var, "file"),
+                  ("HTTP 代理", self.proxy_var, None)]
+        for index, (label, variable, kind) in enumerate(fields):
+            ttk.Label(settings, text=label).grid(row=index, column=0, sticky="e", padx=(0, 5), pady=3)
+            entry = ttk.Entry(settings, textvariable=variable, width=40, show="*" if kind is None else "")
+            entry.grid(row=index, column=1, sticky="ew", pady=3)
+            self.setting_controls.append(entry)
+            if kind:
+                button = ttk.Button(settings, text="浏览", width=6,
+                                    command=lambda v=variable, k=kind: self.browse(v, k))
+                button.grid(row=index, column=2, padx=(5, 0))
+                self.setting_controls.append(button)
+        save = ttk.Button(settings, text="应用配置", command=self.apply_config)
+        save.grid(row=4, column=1, sticky="e", pady=(5, 0))
+        self.setting_controls.append(save)
+        ttk.Button(settings, text="关闭", width=6, command=window.withdraw).grid(row=4, column=2, padx=(5, 0), pady=(5, 0))
+
+    def make_text(self, parent, height):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, height=height, width=1, wrap="word", state="disabled",
+                       relief="flat", font=("Microsoft YaHei UI", 9), padx=3, pady=2)
+        scrollbar = ttk.Scrollbar(frame, command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        return text
+
+    def add_text_tab(self, name, height):
+        frame = ttk.Frame(self.notes)
+        self.notes.add(frame, text=name)
+        return self.make_text(frame, height)
+
+    def log(self, text):
+        # 代理可能包含凭据，不写入界面日志。
+        proxy = self.operations.proxy_url
+        if proxy:
+            text = str(text).replace(proxy, "[已配置代理]")
+        self.logs.configure(state="normal")
+        self.logs.insert("end", f"[{datetime.now():%H:%M:%S}] {text}\n")
+        self.logs.see("end")
+        self.logs.configure(state="disabled")
+
+    def browse(self, variable, kind):
+        path = filedialog.askdirectory(parent=self.root) if kind == "directory" else filedialog.askopenfilename(parent=self.root)
+        if path:
+            variable.set(path)
+
+    def apply_config(self):
+        if self.busy:
+            return
+        root_path = self.resolve_path(self.root_var.get())
+        if not os.path.isdir(os.path.join(root_path, "custom_nodes")):
+            messagebox.showerror("目录不正确", "请选择包含 custom_nodes 文件夹的 ComfyUI 根目录。", parent=self.root)
+            return
+        self.config["Settings"] = dict(self.config["Settings"]) if self.config.has_section("Settings") else {}
+        self.config["Network"] = dict(self.config["Network"]) if self.config.has_section("Network") else {}
+        self.config["Settings"].update(comfyui_root_path=root_path,
+                                       python_path=self.python_var.get().strip(), git_path=self.git_var.get().strip())
+        self.config["Network"]["https_proxy"] = self.proxy_var.get().strip()
         try:
-            rel_path = os.path.relpath(self.comfyui_root, os.getcwd())
-            if ".." in rel_path and not rel_path.startswith(".."): # 简单的判断
-                 self.config['Settings']['comfyui_root_path'] = self.comfyui_root
-            else:
-                 self.config['Settings']['comfyui_root_path'] = rel_path
-        except:
-            self.config['Settings']['comfyui_root_path'] = self.comfyui_root
-
-        self.config['Network']['https_proxy'] = self.proxy_url
-
-        try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                self.config.write(f)
-        except Exception as e:
-            messagebox.showerror("错误", f"保存配置文件失败: {e}")
-
-    # --- UI 事件处理 ---
-    def browse_root(self):
-        path = filedialog.askdirectory(initialdir=self.comfyui_root)
-        if path:
-            self.entry_root.delete(0, tk.END)
-            self.entry_root.insert(0, path)
-            self.apply_config_from_ui()
-
-    def browse_python(self):
-        path = filedialog.askopenfilename(title="选择 Python 可执行文件", filetypes=[("Executables", "*.exe"), ("All Files", "*.*")])
-        if path:
-            self.entry_python.delete(0, tk.END)
-            self.entry_python.insert(0, path)
-            self.apply_config_from_ui()
-    
-    def browse_git(self):
-        path = filedialog.askopenfilename(title="选择 Git 可执行文件", filetypes=[("Executables", "*.exe"), ("All Files", "*.*")])
-        if path:
-            self.entry_git.delete(0, tk.END)
-            self.entry_git.insert(0, path)
-            self.apply_config_from_ui()
-
-    def apply_config_from_ui(self):
-        """从输入框读取并应用设置，然后保存"""
-        self.comfyui_root = self.entry_root.get().strip()
-        self.python_exe = self.entry_python.get().strip()
-        self.git_exe = self.entry_git.get().strip()
-        self.proxy_url = self.entry_proxy.get().strip()
-        
-        self.save_config()
-        self.set_root_path(self.comfyui_root) # 刷新界面
-        self.update_status_bar()
-        messagebox.showinfo("保存", "配置已更新并保存。")
-
-    def update_status_bar(self):
-        msg = f"Git: {self.git_exe} | Python: {self.python_exe} | 代理: {self.proxy_url if self.proxy_url else '无'}"
-        self.status_bar.config(text=msg)
-
-    def set_root_path(self, root_path, update_ui=True):
-        if not root_path: return
-        self.comfyui_root = root_path
+            with CONFIG_FILE.open("w", encoding="utf-8") as stream:
+                self.config.write(stream)
+        except OSError as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self.root)
+            return
+        self.comfy_root = root_path
         self.nodes_path = os.path.join(root_path, "custom_nodes")
-        
-        # 1. 刷新本体 Tab
-        self.core_manager.set_path(self.comfyui_root)
+        self.root_var.set(root_path)
+        self.operations = self.make_operations()
+        self.log("配置已保存。")
+        self.refresh()
 
-        # 2. 刷新插件 Tab
-        if os.path.exists(self.nodes_path):
-            self.refresh_plugin_list()
+    def selected_path(self):
+        if self.notebook.index(self.notebook.select()) == 1:
+            return self.comfy_root if self.comfy_root in self.items else None
+        selected = self.tree.selection()
+        return self.visible_ids.get(selected[0]) if selected else None
+
+    def render_plugins(self):
+        selected = self.selected_path()
+        self.tree.delete(*self.tree.get_children())
+        self.visible_ids.clear()
+        query = self.search_var.get().strip().casefold()
+        filter_name = self.filter_var.get()
+        plugin_items = [(path, info) for path, info in self.items.items() if path != self.comfy_root]
+        for path, info in sorted(plugin_items, key=lambda pair: os.path.basename(pair[0]).casefold()):
+            name = os.path.basename(path)
+            if query not in name.casefold():
+                continue
+            if filter_name == "有更新" and not info["update"]:
+                continue
+            if filter_name == "检查失败" and "失败" not in info["status"]:
+                continue
+            if filter_name == "非 Git 仓库" and info["git"]:
+                continue
+            tag = "error" if "失败" in info["status"] else "update" if info["update"] else "plain" if not info["git"] else ""
+            status = {"与本地远端记录一致": "本地记录一致", "有更新（落后远端）": "有更新",
+                      "本地领先（远端无新内容）": "本地领先", "游离HEAD（历史版本）": "历史版本",
+                      "本地与远端分叉": "分支分叉"}.get(info["status"], info["status"])
+            iid = self.tree.insert("", "end", values=(name, status, info["commit"],
+                                   "可安装" if info["requirements"] else "无"), tags=(tag,))
+            self.visible_ids[iid] = path
+            if path == selected:
+                self.tree.selection_set(iid)
+        if not self.tree.selection() and self.visible_ids:
+            self.tree.selection_set(next(iter(self.visible_ids)))
+        count = len(plugin_items)
+        updates = sum(info["update"] for _, info in plugin_items)
+        self.summary_var.set(f"共 {count} 个插件 · 显示 {len(self.visible_ids)} 个 · {updates} 个有更新")
+        self.show_selected()
+
+    def show_selected(self):
+        path = self.selected_path()
+        info = self.items.get(path)
+        self.detail_var.set(f"{os.path.basename(path)} · {info['status']}" if info else "选择插件后操作 · 双击打开目录")
+        old_version = self.version_var.get()
+        versions = info["versions"] if info else []
+        self.versions.configure(values=versions, state="readonly" if versions and not self.busy else "disabled")
+        self.version_var.set(old_version if old_version in versions else versions[0] if versions else "")
+        for button, enabled in [(self.execute_button, info and info["git"] and versions),
+                                (self.pip_button, info and info["requirements"]),
+                                (self.delete_button, info and path != self.comfy_root)]:
+            button.configure(state="normal" if enabled and not self.busy else "disabled")
+        self.open_button.configure(state="normal" if info else "disabled")
+        content = "\n\n".join(part for part in (info["detail"], path, info["history"]) if part) if info else ""
+        core_active = self.notebook.index(self.notebook.select()) == 1
+        for widget in (self.history, self.core_history):
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("end", content if widget == self.history or core_active else "")
+            widget.configure(state="disabled")
+        # 本体历史在页内展开，底部保留日志，不重复占用一块版本面板。
+        self.notes.tab(0, state="hidden" if core_active else "normal")
+        core = self.items.get(self.comfy_root)
+        if core:
+            self.core_label.configure(text=f"{core['status']} · {core['commit'].split(' - ', 1)[0]}")
+
+    def set_busy(self, value, text):
+        self.busy = value
+        self.status_var.set(text)
+        for control in self.setting_controls + self.operation_controls:
+            control.configure(state="disabled" if value else "normal")
+        if value:
+            self.progress.start(12)
         else:
-            if update_ui: # 避免初始化时弹窗
-                pass 
+            self.progress.stop()
+        self.show_selected()
 
-    def run_cmd(self, cmd_args, cwd, show_window=False):
-        """执行命令，统一处理代理和环境
-        
-        Args:
-            cmd_args: 命令参数列表
-            cwd: 工作目录
-            show_window: 是否显示终端窗口（用于pip安装等需要用户查看进度的操作）
-        """
+    def start_task(self, label, worker, done):
+        if self.busy:
+            return
+        self.set_busy(True, label)
+        self.log(label)
+        def run():
+            try:
+                result = worker()
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+            else:
+                self.events.put(("done", (done, result)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def drain_events(self):
         try:
-            startupinfo = None
-            # 默认隐藏窗口，但show_window=True时显示（用于pip安装）
-            if os.name == 'nt' and not show_window:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-            env = os.environ.copy()
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            env["GCM_INTERACTIVE"] = "never"
-            if self.proxy_url:
-                env["http_proxy"] = self.proxy_url
-                env["https_proxy"] = self.proxy_url
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "log":
+                    self.log(payload)
+                elif kind == "progress":
+                    self.status_var.set(payload)
+                elif kind == "error":
+                    self.set_busy(False, "操作失败，详情见日志")
+                    self.log(payload)
+                    self.notes.select(1)
+                    messagebox.showerror("操作失败", payload, parent=self.root)
+                elif kind == "done":
+                    callback, result = payload
+                    self.set_busy(False, "就绪")
+                    callback(result)
+        except queue.Empty:
+            pass
+        self.root.after(80, self.drain_events)
 
-            result = subprocess.run(
-                cmd_args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', errors='ignore', 
-                startupinfo=startupinfo, env=env, timeout=300 # pip 可能比较慢，超时设长一点
-            )
-            return result.returncode, result.stdout.strip(), result.stderr.strip()
-        except Exception as e:
-            return -1, "", str(e)
+    def inspect_paths(self, paths, fetch=False):
+        results = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(self.operations.inspect, path, fetch): path for path in paths}
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    results[path] = future.result()
+                except Exception as exc:
+                    results[path] = dict(status="检查失败", update=False,
+                                         git=os.path.exists(os.path.join(path, ".git")),
+                                         requirements=os.path.isfile(os.path.join(path, "requirements.txt")),
+                                         versions=[], commit="", history="", detail=str(exc))
+                info = results[path]
+                if "失败" in info["status"]:
+                    self.events.put(("log", f"{os.path.basename(path)}：{info['detail']}"))
+                self.events.put(("progress", f"{'检查更新' if fetch else '读取本地信息'} {len(results)}/{len(paths)}"))
+        return results
 
-    def refresh_plugin_list(self):
-        for widget in self.list_container.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.plugin_rows.clear()
-
-        if not os.path.exists(self.nodes_path): return
-
-        folders = [f for f in os.listdir(self.nodes_path) if os.path.isdir(os.path.join(self.nodes_path, f))]
-        
-        for folder in folders:
-            if folder.startswith("__") or folder.startswith("."): continue
-            row = PluginRow(self.list_container.scrollable_frame, self, folder)
-            self.plugin_rows.append(row)
-
-    def update_all_plugins(self):
-        targets = [row for row in self.plugin_rows if row.is_update_available]
-        if not targets:
-            messagebox.showinfo("提示", "当前没有检测到需要更新的插件。")
+    def refresh(self, check_remote=False):
+        if self.busy:
             return
-
-        if not messagebox.askyesno("批量更新", f"检测到 {len(targets)} 个插件有新版本。\n是否开始批量更新？"):
+        if not self.nodes_path or not os.path.isdir(self.nodes_path):
+            self.status_var.set("请配置包含 custom_nodes 的 ComfyUI 根目录，并应用配置")
             return
+        def scan():
+            with os.scandir(self.nodes_path) as entries:
+                paths = [entry.path for entry in entries if not entry.name.startswith((".", "__"))
+                         and entry.is_dir()]
+            return self.inspect_paths([self.comfy_root] + paths)
+        def done(result):
+            self.items = result
+            self.render_plugins()
+            self.status_var.set("本地列表已刷新；点击“检查更新”获取远端状态")
+            if check_remote:
+                self.check_updates()
+        self.start_task("正在读取本地插件信息…", scan, done)
 
-        self.btn_update_all.config(state="disabled", text="正在更新...")
-        
-        def run_batch():
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                for row in targets:
-                    row.btn_action.config(state="disabled", text="队列中...")
-                    executor.submit(row.do_update, "最新版本 (Latest)", True)
-            
-            self.root.after(0, lambda: self.btn_update_all.config(state="normal", text="一键更新所有插件"))
-            self.root.after(0, lambda: messagebox.showinfo("完成", "批量更新流程已结束。"))
+    def check_updates(self, core_only=False):
+        if self.busy:
+            return
+        paths = [self.comfy_root] if core_only and self.comfy_root in self.items else list(self.items) if not core_only else []
+        if not paths:
+            return
+        def done(result):
+            self.items.update(result)
+            self.render_plugins()
+            failures = sum("失败" in info["status"] for info in result.values())
+            text = f"检查完成：{len(result)} 项，失败 {failures} 项"
+            self.status_var.set(text)
+            self.log(text)
+        self.start_task("正在检查远端更新…", lambda: self.inspect_paths(paths, True), done)
 
-        threading.Thread(target=run_batch, daemon=True).start()
+    def perform(self, label, path, action, delete=False):
+        def worker():
+            message = action()
+            info = None if delete else self.inspect_paths([path])[path]
+            return message, info
+        def done(result):
+            message, info = result
+            if delete:
+                self.items.pop(path, None)
+            else:
+                self.items[path] = info
+            self.render_plugins()
+            self.log(f"{os.path.basename(path)}：{message}")
+            self.status_var.set(message)
+            messagebox.showinfo("操作完成", message + "\n\n插件或版本变更后，请重启 ComfyUI 生效。", parent=self.root)
+        self.start_task(label, worker, done)
+
+    def execute(self):
+        path = self.selected_path()
+        selection = self.version_var.get()
+        if not path or not selection or self.busy:
+            return
+        if messagebox.askyesno("确认版本操作", f"{os.path.basename(path)}\n\n目标：{selection}\n\n继续执行？", parent=self.root):
+            self.perform("正在更新 / 切换版本…", path, lambda: self.operations.update(path, selection))
+
+    def install(self):
+        path = self.selected_path()
+        if not path or self.busy:
+            return
+        if messagebox.askyesno("安装依赖", f"为 {os.path.basename(path)} 安装 requirements.txt 中的依赖。\n\nPython：{self.operations.python_exe}\n安装进度将在独立终端中显示。\n\n继续？", parent=self.root):
+            self.perform("正在安装依赖，请查看终端…", path, lambda: self.operations.install_requirements(path))
+
+    def delete(self):
+        path = self.selected_path()
+        if not path or path == self.comfy_root or self.busy:
+            return
+        if messagebox.askyesno("确认删除插件", f"将永久删除此插件目录及其中的文件：\n{path}\n\n确定删除？", parent=self.root):
+            self.perform("正在删除插件…", path, lambda: self.operations.remove_plugin(path, self.nodes_path), delete=True)
+
+    def update_all(self):
+        if self.busy:
+            return
+        paths = [path for path, info in self.items.items() if path != self.comfy_root and info["update"]]
+        if not paths:
+            messagebox.showinfo("批量更新", "当前没有已检测到更新的插件。可先点击“检查更新”。", parent=self.root)
+            return
+        if not messagebox.askyesno("批量更新", f"更新 {len(paths)} 个有新版的插件？\n结果将在操作日志中逐项显示。", parent=self.root):
+            return
+        def worker():
+            failures = []
+            for index, path in enumerate(paths, 1):
+                name = os.path.basename(path)
+                self.events.put(("progress", f"正在更新 {index}/{len(paths)}：{name}"))
+                try:
+                    message = self.operations.update(path, LATEST)
+                    self.events.put(("log", f"成功 · {name}：{message}"))
+                except Exception as exc:
+                    failures.append(name)
+                    self.events.put(("log", f"失败 · {name}：{exc}"))
+            return failures, self.inspect_paths(paths)
+        def done(result):
+            failures, infos = result
+            self.items.update(infos)
+            self.render_plugins()
+            self.notes.select(1)
+            text = f"批量更新完成：成功 {len(paths) - len(failures)} 项，失败 {len(failures)} 项。"
+            self.log(text)
+            self.status_var.set(text)
+            if failures:
+                messagebox.showwarning("批量更新结果", text + "\n\n失败项：\n" + "\n".join(failures) + "\n\n具体原因见操作日志。", parent=self.root)
+            else:
+                messagebox.showinfo("批量更新结果", text + "\n\n请重启 ComfyUI 生效。", parent=self.root)
+        self.start_task("开始批量更新…", worker, done)
+
+    def open_folder(self):
+        path = self.selected_path()
+        if path:
+            try:
+                os.startfile(path)
+            except OSError as exc:
+                messagebox.showerror("打开目录失败", str(exc), parent=self.root)
+
+    def on_close(self):
+        if self.busy:
+            self.status_var.set("任务正在执行，请等待完成后关闭；依赖安装请先关闭安装终端。")
+            return
+        self.root.destroy()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
