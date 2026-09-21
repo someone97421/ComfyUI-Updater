@@ -366,7 +366,7 @@ class ComfyUpdaterApp:
 
     def inspect_paths(self, paths, fetch=False):
         results = {}
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=max(1, len(paths))) as pool:
             futures = {pool.submit(self.operations.inspect, path, fetch): path for path in paths}
             for future in as_completed(futures):
                 path = futures[future]
@@ -467,15 +467,19 @@ class ComfyUpdaterApp:
             return
         def worker():
             failures = []
-            for index, path in enumerate(paths, 1):
+            def update_one(path):
                 name = os.path.basename(path)
-                self.events.put(("progress", f"正在更新 {index}/{len(paths)}：{name}"))
                 try:
                     message = self.operations.update(path, LATEST)
                     self.events.put(("log", f"成功 · {name}：{message}"))
                 except Exception as exc:
                     failures.append(name)
                     self.events.put(("log", f"失败 · {name}：{exc}"))
+            with ThreadPoolExecutor(max_workers=len(paths)) as pool:
+                futures = [pool.submit(update_one, path) for path in paths]
+                for index, future in enumerate(as_completed(futures), 1):
+                    future.result()
+                    self.events.put(("progress", f"批量更新 {index}/{len(paths)}"))
             return failures, self.inspect_paths(paths)
         def done(result):
             failures, infos = result
