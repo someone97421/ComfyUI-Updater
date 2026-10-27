@@ -4,7 +4,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -15,6 +15,31 @@ from operations import LATEST, Operations
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.ini"
+STATUS_COLORS = {
+    "current": "#15803d",
+    "update": "#a45b00",
+    "error": "#b42318",
+    "local": "#1d4ed8",
+    "history": "#7e22ce",
+    "plain": "#667085",
+}
+
+
+def status_tag(info):
+    if not info:
+        return "plain"
+    status = info["status"]
+    if "失败" in status or status in ("目录不存在", "本地与远端分叉"):
+        return "error"
+    if info["update"] or status == "无上游分支":
+        return "update"
+    if status == "最新版本":
+        return "current"
+    if status in ("与本地远端记录一致", "本地领先（远端无新内容）"):
+        return "local"
+    if status == "游离HEAD（历史版本）":
+        return "history"
+    return "plain"
 
 
 class ComfyUpdaterApp:
@@ -27,6 +52,29 @@ class ComfyUpdaterApp:
         self.busy = False
         self.items = {}
         self.visible_ids = {}
+        self.scan_id = 0
+        self.scan_active = False
+        self.scan_jobs = set()
+        self.scan_status = ""
+        self.scan_completed = 0
+        self.scan_failures = 0
+        self.scan_total = 0
+        self.scan_batches = 0
+        self.scan_fetch = False
+        self.scan_skipped = 0
+        self.discovering = False
+        self.pending_check = None
+        self.startup_plugins = None
+        self.read_jobs = {}
+        self.next_job_id = 0
+        self.item_revisions = {}
+        self.path_locks = {}
+        self.details_pending = {}
+        self.detail_path = None
+        self.busy_paths = set()
+        self.closing = False
+        self.progress_running = False
+        self.history_contents = {}
         self.config = configparser.ConfigParser(interpolation=None)
         self.config_error = ""
         try:
@@ -59,7 +107,7 @@ class ComfyUpdaterApp:
         if self.config_error:
             self.log(self.config_error)
         if self.comfy_root:
-            self.refresh(check_remote=True)
+            root.after_idle(lambda: self.refresh(check_remote=True))
 
     def resolve_path(self, value):
         value = os.path.expandvars(os.path.expanduser(value.strip().strip('"')))
@@ -119,9 +167,8 @@ class ComfyUpdaterApp:
             self.tree.heading(key, text=title, anchor="w")
             self.tree.column(key, width=width, minwidth=width if key in ("status", "req") else 90,
                              stretch=key in ("name", "commit"))
-        self.tree.tag_configure("update", foreground="#a45b00")
-        self.tree.tag_configure("error", foreground="#b42318")
-        self.tree.tag_configure("plain", foreground="#667085")
+        for tag, color in STATUS_COLORS.items():
+            self.tree.tag_configure(tag, foreground=color)
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -143,7 +190,8 @@ class ComfyUpdaterApp:
 
         detail = ttk.Frame(self.root, padding=(6, 4))
         detail.grid(row=2, column=0, sticky="ew")
-        ttk.Label(detail, textvariable=self.detail_var, anchor="w").pack(fill="x")
+        self.detail_label = ttk.Label(detail, textvariable=self.detail_var, anchor="w")
+        self.detail_label.pack(fill="x")
         actions = ttk.Frame(detail)
         actions.pack(fill="x", pady=(3, 0))
         self.versions = ttk.Combobox(actions, textvariable=self.version_var, state="disabled", width=22)
@@ -246,6 +294,11 @@ class ComfyUpdaterApp:
         except OSError as exc:
             messagebox.showerror("保存失败", str(exc), parent=self.root)
             return
+        self.cancel_scan()
+        self.invalidate_paths(list(self.items))
+        if root_path != self.comfy_root:
+            self.items.clear()
+            self.render_plugins()
         self.comfy_root = root_path
         self.nodes_path = os.path.join(root_path, "custom_nodes")
         self.root_var.set(root_path)
@@ -261,8 +314,8 @@ class ComfyUpdaterApp:
 
     def render_plugins(self):
         selected = self.selected_path()
-        self.tree.delete(*self.tree.get_children())
-        self.visible_ids.clear()
+        existing = {path: iid for iid, path in self.visible_ids.items()}
+        visible = {}
         query = self.search_var.get().strip().casefold()
         filter_name = self.filter_var.get()
         plugin_items = [(path, info) for path, info in self.items.items() if path != self.comfy_root]
@@ -276,15 +329,24 @@ class ComfyUpdaterApp:
                 continue
             if filter_name == "非 Git 仓库" and info["git"]:
                 continue
-            tag = "error" if "失败" in info["status"] else "update" if info["update"] else "plain" if not info["git"] else ""
+            tag = status_tag(info)
             status = {"与本地远端记录一致": "本地记录一致", "有更新（落后远端）": "有更新",
                       "本地领先（远端无新内容）": "本地领先", "游离HEAD（历史版本）": "历史版本",
                       "本地与远端分叉": "分支分叉"}.get(info["status"], info["status"])
-            iid = self.tree.insert("", "end", values=(name, status, info["commit"],
-                                   "可安装" if info["requirements"] else "无"), tags=(tag,))
-            self.visible_ids[iid] = path
-            if path == selected:
-                self.tree.selection_set(iid)
+            values = (name, status, info["commit"], "可安装" if info["requirements"] else "无")
+            iid = existing.get(path)
+            if iid is None:
+                iid = self.tree.insert("", "end", values=values, tags=(tag,))
+            else:
+                self.tree.item(iid, values=values, tags=(tag,))
+            self.tree.move(iid, "", len(visible))
+            visible[iid] = path
+        for iid in self.visible_ids.keys() - visible.keys():
+            self.tree.delete(iid)
+        self.visible_ids = visible
+        if selected in existing and existing[selected] in visible:
+            if self.tree.selection() != (existing[selected],):
+                self.tree.selection_set(existing[selected])
         if not self.tree.selection() and self.visible_ids:
             self.tree.selection_set(next(iter(self.visible_ids)))
         count = len(plugin_items)
@@ -296,7 +358,13 @@ class ComfyUpdaterApp:
         path = self.selected_path()
         info = self.items.get(path)
         self.detail_var.set(f"{os.path.basename(path)} · {info['status']}" if info else "选择插件后操作 · 双击打开目录")
-        old_version = self.version_var.get()
+        self.detail_label.configure(foreground=STATUS_COLORS[status_tag(info)])
+        old_version = self.version_var.get() if path == self.detail_path else ""
+        if path != self.detail_path:
+            previous = self.read_jobs.get(self.details_pending.get(self.detail_path))
+            if previous:
+                previous[1].set()
+        self.detail_path = path
         versions = info["versions"] if info else []
         self.versions.configure(values=versions, state="readonly" if versions and not self.busy else "disabled")
         self.version_var.set(old_version if old_version in versions else versions[0] if versions else "")
@@ -308,30 +376,99 @@ class ComfyUpdaterApp:
         content = "\n\n".join(part for part in (info["detail"], path, info["history"]) if part) if info else ""
         core_active = self.notebook.index(self.notebook.select()) == 1
         for widget in (self.history, self.core_history):
-            widget.configure(state="normal")
-            widget.delete("1.0", "end")
-            widget.insert("end", content if widget == self.history or core_active else "")
-            widget.configure(state="disabled")
+            text = content if widget == self.history or core_active else ""
+            if self.history_contents.get(widget) != text:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("end", text)
+                widget.configure(state="disabled")
+                self.history_contents[widget] = text
         # 本体历史在页内展开，底部保留日志，不重复占用一块版本面板。
         self.notes.tab(0, state="hidden" if core_active else "normal")
         core = self.items.get(self.comfy_root)
         if core:
-            self.core_label.configure(text=f"{core['status']} · {core['commit'].split(' - ', 1)[0]}")
+            self.core_label.configure(text=f"{core['status']} · {core['commit'].split(' - ', 1)[0]}",
+                                      foreground=STATUS_COLORS[status_tag(core)])
+        else:
+            self.core_label.configure(text="请设置 ComfyUI 根目录", foreground=STATUS_COLORS["plain"])
+        if info and info["git"] and not info.get("details_loaded") and not self.busy and not self.closing:
+            self.request_details(path)
 
     def set_busy(self, value, text):
         self.busy = value
-        self.status_var.set(text)
+        self.update_activity(text)
         for control in self.setting_controls + self.operation_controls:
             control.configure(state="disabled" if value else "normal")
-        if value:
-            self.progress.start(12)
-        else:
-            self.progress.stop()
+        if not value:
+            self.busy_paths.clear()
         self.show_selected()
 
-    def start_task(self, label, worker, done):
+    def update_activity(self, text="就绪"):
+        if not self.busy and self.scan_active:
+            text = self.scan_status
+        self.status_var.set(text)
+        active = self.busy or self.scan_active
+        if active and not self.progress_running:
+            self.progress.start(12)
+        elif not active and self.progress_running:
+            self.progress.stop()
+        self.progress_running = active
+
+    def new_read_job(self, path):
+        self.next_job_id += 1
+        job_id = self.next_job_id
+        cancel = threading.Event()
+        self.read_jobs[job_id] = (path, cancel)
+        lock = self.path_locks.setdefault(path, threading.Lock())
+        operations = Operations(self.operations.git_exe, self.operations.python_exe,
+                                self.operations.proxy_url, cancel)
+        return job_id, cancel, lock, operations, self.item_revisions.get(path, 0)
+
+    def invalidate_paths(self, paths):
+        paths = set(paths)
+        for path in paths:
+            self.item_revisions[path] = self.item_revisions.get(path, 0) + 1
+        for path, cancel in self.read_jobs.values():
+            if path in paths:
+                cancel.set()
+
+    def cancel_scan(self):
+        self.scan_id += 1
+        for job_id in self.scan_jobs:
+            job = self.read_jobs.get(job_id)
+            if job:
+                job[1].set()
+        self.scan_jobs.clear()
+        self.scan_active = False
+        self.discovering = False
+        self.pending_check = None
+        self.startup_plugins = None
+
+    def request_details(self, path):
+        if path in self.details_pending:
+            return
+        job_id, cancel, lock, operations, revision = self.new_read_job(path)
+        self.details_pending[path] = job_id
+        def worker():
+            details = None
+            try:
+                with lock:
+                    operations._check_cancelled()
+                    details = operations.read_details(path)
+            except CancelledError:
+                pass
+            except Exception as exc:
+                details = dict(details_loaded=True, history=f"版本记录读取失败：{exc}")
+            self.events.put(("details", (job_id, path, revision, details)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_task(self, label, worker, done, paths):
         if self.busy:
             return
+        self.invalidate_paths(paths)
+        self.busy_paths = set(paths)
+        if any(self.path_locks.get(path) and self.path_locks[path].locked() for path in paths):
+            label += "（等待当前仓库的 Git 命令结束）"
         self.set_busy(True, label)
         self.log(label)
         def run():
@@ -344,8 +481,9 @@ class ComfyUpdaterApp:
         threading.Thread(target=run, daemon=True).start()
 
     def drain_events(self):
+        redraw = False
         try:
-            while True:
+            for _ in range(200):
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self.log(payload)
@@ -358,81 +496,211 @@ class ComfyUpdaterApp:
                     messagebox.showerror("操作失败", payload, parent=self.root)
                 elif kind == "done":
                     callback, result = payload
-                    self.set_busy(False, "就绪")
+                    self.busy_paths.clear()
                     callback(result)
+                elif kind == "discovered":
+                    scan_id, descriptions, revisions, error, check_remote = payload
+                    if scan_id != self.scan_id or self.closing:
+                        continue
+                    self.discovering = False
+                    pending_check, self.pending_check = self.pending_check, None
+                    if error:
+                        self.scan_active = False
+                        if not self.busy:
+                            self.update_activity("读取目录失败，详情见日志")
+                        self.log(error)
+                        continue
+                    items = {path: self.items.get(path, info) for path, info in descriptions.items()
+                             if self.item_revisions.get(path, 0) == revisions.get(path, 0) or path in self.items}
+                    items.update({path: info for path, info in self.items.items()
+                                  if self.item_revisions.get(path, 0) != revisions.get(path, 0)})
+                    self.items = items
+                    if check_remote and pending_check is None:
+                        self.startup_plugins = [path for path in items if path != self.comfy_root]
+                        self.scan_status = "正在自动检查 ComfyUI 本体更新…"
+                        if not self.busy:
+                            self.update_activity()
+                        self.log(self.scan_status)
+                        self.launch_scan([self.comfy_root], True)
+                    else:
+                        local_paths = [path for path in items if pending_check is not True or path != self.comfy_root]
+                        self.launch_scan(local_paths, pending_check is False)
+                        if pending_check is True and self.comfy_root in items:
+                            self.launch_scan([self.comfy_root], True)
+                    redraw = True
+                elif kind == "scan_result":
+                    scan_id, job_id, path, revision, info = payload
+                    self.read_jobs.pop(job_id, None)
+                    self.scan_jobs.discard(job_id)
+                    if scan_id != self.scan_id or self.closing:
+                        continue
+                    self.scan_completed += 1
+                    if info is not None and revision == self.item_revisions.get(path, 0) and path in self.items:
+                        previous = self.items[path]
+                        if info["git"] and previous["git"]:
+                            info["versions"] = previous["versions"]
+                            info["history"] = previous["history"]
+                        self.invalidate_paths([path])
+                        self.items[path] = info
+                        if "失败" in info["status"]:
+                            self.scan_failures += 1
+                            self.log(f"{os.path.basename(path)}：{info['detail']}")
+                        redraw = True
+                    else:
+                        self.scan_skipped += 1
+                    self.scan_status = f"后台检查 {self.scan_completed}/{self.scan_total}"
+                    if not self.busy:
+                        self.update_activity()
+                elif kind == "scan_done":
+                    scan_id, fetch = payload
+                    if scan_id != self.scan_id or self.closing:
+                        continue
+                    self.scan_batches -= 1
+                    if self.scan_batches:
+                        continue
+                    if self.startup_plugins is not None:
+                        paths = [path for path in self.startup_plugins if path in self.items]
+                        self.startup_plugins = None
+                        if paths:
+                            self.scan_status = "本体检查已结束，正在自动检查插件更新…"
+                            if not self.busy:
+                                self.update_activity()
+                            self.log(self.scan_status)
+                            self.launch_scan(paths, True)
+                            continue
+                    self.scan_active = False
+                    text = (f"检查完成：{self.scan_completed - self.scan_skipped} 项，失败 {self.scan_failures} 项，跳过 {self.scan_skipped} 项" if self.scan_fetch
+                            else "本地列表已刷新；点击“检查更新”获取远端状态")
+                    if not self.busy:
+                        self.update_activity(text)
+                    self.log(text)
+                elif kind == "details":
+                    job_id, path, revision, details = payload
+                    self.read_jobs.pop(job_id, None)
+                    if self.details_pending.get(path) == job_id:
+                        self.details_pending.pop(path)
+                    if self.closing:
+                        continue
+                    if details is not None and revision == self.item_revisions.get(path, 0) and path in self.items:
+                        self.items[path].update(details)
+                    redraw = True
         except queue.Empty:
             pass
+        if redraw and not self.closing:
+            self.render_plugins()
         self.root.after(80, self.drain_events)
 
-    def inspect_paths(self, paths, fetch=False):
-        results = {}
-        with ThreadPoolExecutor(max_workers=max(1, len(paths))) as pool:
-            futures = {pool.submit(self.operations.inspect, path, fetch): path for path in paths}
-            for future in as_completed(futures):
-                path = futures[future]
+    def begin_scan(self, label):
+        self.cancel_scan()
+        self.scan_active = True
+        self.scan_status = label
+        self.scan_completed = self.scan_failures = self.scan_total = 0
+        self.scan_batches = self.scan_skipped = 0
+        self.scan_fetch = False
+        self.update_activity()
+        return self.scan_id
+
+    def launch_scan(self, paths, fetch):
+        scan_id = self.scan_id
+        jobs = queue.Queue()
+        for path in paths:
+            if path in self.busy_paths:
+                continue
+            job = self.new_read_job(path)
+            self.scan_jobs.add(job[0])
+            jobs.put((path, job))
+        self.scan_total += jobs.qsize()
+        self.scan_batches += 1
+        self.scan_fetch = self.scan_fetch or fetch
+        def worker():
+            while True:
                 try:
-                    results[path] = future.result()
+                    path, (job_id, cancel, lock, operations, revision) = jobs.get_nowait()
+                except queue.Empty:
+                    return
+                info = None
+                try:
+                    with lock:
+                        operations._check_cancelled()
+                        info = operations.inspect(path, fetch, details=False)
+                except CancelledError:
+                    pass
                 except Exception as exc:
-                    results[path] = dict(status="检查失败", update=False,
-                                         git=os.path.exists(os.path.join(path, ".git")),
-                                         requirements=os.path.isfile(os.path.join(path, "requirements.txt")),
-                                         versions=[], commit="", history="", detail=str(exc))
-                info = results[path]
-                if "失败" in info["status"]:
-                    self.events.put(("log", f"{os.path.basename(path)}：{info['detail']}"))
-                self.events.put(("progress", f"{'检查更新' if fetch else '读取本地信息'} {len(results)}/{len(paths)}"))
-        return results
+                    info = operations.describe(path)
+                    info.update(status="检查失败", detail=str(exc))
+                self.events.put(("scan_result", (scan_id, job_id, path, revision, info)))
+        def run():
+            threads = [threading.Thread(target=worker, daemon=True) for _ in range(jobs.qsize())]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.events.put(("scan_done", (scan_id, fetch)))
+        threading.Thread(target=run, daemon=True).start()
 
     def refresh(self, check_remote=False):
-        if self.busy:
+        if self.busy or self.closing:
             return
-        if not self.nodes_path or not os.path.isdir(self.nodes_path):
+        if not self.nodes_path:
             self.status_var.set("请配置包含 custom_nodes 的 ComfyUI 根目录，并应用配置")
             return
-        def scan():
-            with os.scandir(self.nodes_path) as entries:
-                paths = [entry.path for entry in entries if not entry.name.startswith((".", "__"))
-                         and entry.is_dir()]
-            return self.inspect_paths([self.comfy_root] + paths)
-        def done(result):
-            self.items = result
-            self.render_plugins()
-            self.status_var.set("本地列表已刷新；点击“检查更新”获取远端状态")
-            if check_remote:
-                self.check_updates()
-        self.start_task("正在读取本地插件信息…", scan, done)
+        scan_id = self.begin_scan("正在读取插件目录…")
+        self.discovering = True
+        self.invalidate_paths(list(self.items))
+        root_path, nodes_path, operations = self.comfy_root, self.nodes_path, self.operations
+        revisions = dict(self.item_revisions)
+        def discover():
+            descriptions, error = {}, ""
+            try:
+                with os.scandir(nodes_path) as entries:
+                    paths = [entry.path for entry in entries if not entry.name.startswith((".", "__"))
+                             and entry.is_dir()]
+                descriptions = {path: operations.describe(path) for path in [root_path] + paths}
+            except OSError as exc:
+                error = str(exc)
+            self.events.put(("discovered", (scan_id, descriptions, revisions, error, check_remote)))
+        threading.Thread(target=discover, daemon=True).start()
 
     def check_updates(self, core_only=False):
-        if self.busy:
+        if self.busy or self.closing:
+            return
+        if self.discovering:
+            self.pending_check = core_only if self.pending_check is None else self.pending_check and core_only
             return
         paths = [self.comfy_root] if core_only and self.comfy_root in self.items else list(self.items) if not core_only else []
         if not paths:
             return
-        def done(result):
-            self.items.update(result)
-            self.render_plugins()
-            failures = sum("失败" in info["status"] for info in result.values())
-            text = f"检查完成：{len(result)} 项，失败 {failures} 项"
-            self.status_var.set(text)
-            self.log(text)
-        self.start_task("正在检查远端更新…", lambda: self.inspect_paths(paths, True), done)
+        if core_only and self.scan_active:
+            self.invalidate_paths(paths)
+        else:
+            self.begin_scan("正在后台检查远端更新…")
+        self.launch_scan(paths, True)
 
     def perform(self, label, path, action, delete=False):
         def worker():
-            message = action()
-            info = None if delete else self.inspect_paths([path])[path]
-            return message, info
+            with self.path_locks.setdefault(path, threading.Lock()):
+                failed = False
+                try:
+                    message = action()
+                except Exception as exc:
+                    message, failed = str(exc), True
+                info = None if delete and not failed else self.operations.inspect(path, details=False)
+            return message, info, failed
         def done(result):
-            message, info = result
-            if delete:
+            message, info, failed = result
+            if info is None:
                 self.items.pop(path, None)
             else:
                 self.items[path] = info
+            self.set_busy(False, "操作失败，详情见日志" if failed else message)
             self.render_plugins()
             self.log(f"{os.path.basename(path)}：{message}")
-            self.status_var.set(message)
-            messagebox.showinfo("操作完成", message + "\n\n插件或版本变更后，请重启 ComfyUI 生效。", parent=self.root)
-        self.start_task(label, worker, done)
+            if failed:
+                self.notes.select(1)
+                messagebox.showerror("操作失败", message, parent=self.root)
+            else:
+                messagebox.showinfo("操作完成", message + "\n\n插件或版本变更后，请重启 ComfyUI 生效。", parent=self.root)
+        self.start_task(label, worker, done, [path])
 
     def execute(self):
         path = self.selected_path()
@@ -466,24 +734,32 @@ class ComfyUpdaterApp:
         if not messagebox.askyesno("批量更新", f"更新 {len(paths)} 个有新版的插件？\n结果将在操作日志中逐项显示。", parent=self.root):
             return
         def worker():
-            failures = []
+            failures, infos = [], {}
             def update_one(path):
                 name = os.path.basename(path)
-                try:
-                    message = self.operations.update(path, LATEST)
-                    self.events.put(("log", f"成功 · {name}：{message}"))
-                except Exception as exc:
-                    failures.append(name)
-                    self.events.put(("log", f"失败 · {name}：{exc}"))
+                failed = False
+                with self.path_locks.setdefault(path, threading.Lock()):
+                    try:
+                        message = self.operations.update(path, LATEST)
+                        self.events.put(("log", f"成功 · {name}：{message}"))
+                    except Exception as exc:
+                        failed = True
+                        self.events.put(("log", f"失败 · {name}：{exc}"))
+                    info = self.operations.inspect(path, details=False)
+                return failed, info
             with ThreadPoolExecutor(max_workers=len(paths)) as pool:
-                futures = [pool.submit(update_one, path) for path in paths]
+                futures = {pool.submit(update_one, path): path for path in paths}
                 for index, future in enumerate(as_completed(futures), 1):
-                    future.result()
+                    path = futures[future]
+                    failed, infos[path] = future.result()
+                    if failed:
+                        failures.append(os.path.basename(path))
                     self.events.put(("progress", f"批量更新 {index}/{len(paths)}"))
-            return failures, self.inspect_paths(paths)
+            return failures, infos
         def done(result):
             failures, infos = result
             self.items.update(infos)
+            self.set_busy(False, "就绪")
             self.render_plugins()
             self.notes.select(1)
             text = f"批量更新完成：成功 {len(paths) - len(failures)} 项，失败 {len(failures)} 项。"
@@ -493,7 +769,7 @@ class ComfyUpdaterApp:
                 messagebox.showwarning("批量更新结果", text + "\n\n失败项：\n" + "\n".join(failures) + "\n\n具体原因见操作日志。", parent=self.root)
             else:
                 messagebox.showinfo("批量更新结果", text + "\n\n请重启 ComfyUI 生效。", parent=self.root)
-        self.start_task("开始批量更新…", worker, done)
+        self.start_task("开始批量更新…", worker, done, paths)
 
     def open_folder(self):
         path = self.selected_path()
@@ -507,7 +783,18 @@ class ComfyUpdaterApp:
         if self.busy:
             self.status_var.set("任务正在执行，请等待完成后关闭；依赖安装请先关闭安装终端。")
             return
-        self.root.destroy()
+        self.closing = True
+        self.cancel_scan()
+        for _, cancel in self.read_jobs.values():
+            cancel.set()
+        self.root.withdraw()
+        self.finish_close()
+
+    def finish_close(self):
+        if self.read_jobs:
+            self.root.after(50, self.finish_close)
+        else:
+            self.root.destroy()
 
 
 if __name__ == "__main__":

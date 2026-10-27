@@ -9,6 +9,8 @@ import stat
 import sys
 import shutil
 import subprocess
+import time
+from concurrent.futures import CancelledError
 
 # 版本下拉框的第一项，含义是“跟随当前分支远端最新版”。
 LATEST = '最新版本 (Latest)'
@@ -20,11 +22,12 @@ _GIT_TIMEOUT = 90
 class Operations:
     """底层操作集合，UI 层只调这里的方法。"""
 
-    def __init__(self, git_exe, python_exe, proxy_url):
+    def __init__(self, git_exe, python_exe, proxy_url, cancel_event=None):
         # git / python 可执行文件路径，proxy_url 为空表示不走代理。
         self.git_exe = (git_exe or 'git').strip() or 'git'
         self.python_exe = (python_exe or '').strip()
         self.proxy_url = (proxy_url or '').strip()
+        self.cancel_event = cancel_event
 
     # ---------- 内部小工具 ----------
 
@@ -49,21 +52,56 @@ class Operations:
             env['HTTPS_PROXY'] = self.proxy_url
         return env
 
+    def _check_cancelled(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise CancelledError()
+
+    def _stop_git(self, proc):
+        if os.name == 'nt' and proc.poll() is None:
+            try:
+                subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=5)
+
     def _run_git(self, args, cwd):
-        # 跑 git：列表传参防注入，隐藏窗口，超时 90 秒。
+        self._check_cancelled()
         cmd = [self.git_exe] + list(args)
         startupinfo = None
         if os.name == 'nt':
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         try:
-            p = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                startupinfo=startupinfo, env=self._env(), timeout=_GIT_TIMEOUT,
+                startupinfo=startupinfo, env=self._env(),
             )
-            out = p.stdout.decode('utf-8', 'replace').strip()
-            err = p.stderr.decode('utf-8', 'replace').strip()
-            return p.returncode, self._redact(out), self._redact(err)
+            deadline = time.monotonic() + _GIT_TIMEOUT
+            try:
+                while True:
+                    # fetch 会写入 Git 引用，取消时等当前命令收尾，避免遗留锁文件。
+                    if args[0] != 'fetch':
+                        self._check_cancelled()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(cmd, _GIT_TIMEOUT)
+                    try:
+                        out, err = proc.communicate(timeout=min(0.2, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except (CancelledError, subprocess.TimeoutExpired):
+                self._stop_git(proc)
+                raise
+            self._check_cancelled()
+            return (proc.returncode, self._redact(out.decode('utf-8', 'replace').strip()),
+                    self._redact(err.decode('utf-8', 'replace').strip()))
+        except CancelledError:
+            raise
         except subprocess.TimeoutExpired:
             return -1, '', 'git 执行超时（90 秒）'
         except Exception as e:  # noqa: BLE001 - 路径不存在等情况要转成返回值
@@ -115,13 +153,6 @@ class Operations:
                     versions.append('Commit: %s' % c)
         return versions
 
-    def _current_commit(self, path):
-        code, out, _ = self._run_git(
-            ['log', '-1', '--format=%h - %s (%cd)', '--date=short'], path)
-        if code == 0:
-            return out.strip()
-        return ''
-
     def _history_text(self, path, has_upstream):
         # 更新记录：待更新 + 最近已安装；无上游时只给最近历史。
         parts = []
@@ -142,41 +173,48 @@ class Operations:
 
     # ---------- 对外接口 ----------
 
-    def inspect(self, path, fetch=False):
-        """检查仓库状态，不弹 UI。
-
-        fetch=True 会先 git fetch --prune 拉远端；
-        fetch=False 只看本地远端记录，detail 里会注明。
-        fetch 失败时状态为检查失败，不会误报最新。
-        """
-        path = os.path.abspath(os.path.normpath(path))
-        req = os.path.join(path, 'requirements.txt')
-        has_req = os.path.isfile(req)
-        base = {'git': False, 'update': False, 'requirements': has_req,
-                'versions': [], 'commit': '', 'history': '', 'detail': ''}
-
+    def describe(self, path):
+        """快速列出目录和可用操作，不启动 Git。"""
+        is_git = os.path.lexists(os.path.join(path, '.git'))
+        base = dict(git=is_git, update=False,
+                    requirements=os.path.isfile(os.path.join(path, 'requirements.txt')),
+                    versions=[LATEST] if is_git else [], commit='', history='',
+                    status='等待读取' if is_git else '非Git仓库',
+                    detail='' if is_git else '该目录不是 Git 仓库（未找到 .git）。',
+                    details_loaded=not is_git)
         if not os.path.isdir(path):
-            base.update(status='目录不存在', detail='目录不存在：%s' % path)
-            return base
-        # 只认本目录下的 .git，防止父目录仓库误识别。
-        if not os.path.lexists(os.path.join(path, '.git')):
-            base.update(status='非Git仓库',
-                        detail='该目录不是 Git 仓库（未找到 .git）。')
-            return base
-        base['git'] = True
+            base.update(git=False, versions=[], details_loaded=True,
+                        status='目录不存在', detail='目录不存在：%s' % path)
+        return base
 
-        code, _, err = self._run_git(['rev-parse', '--verify', 'HEAD'], path)
+    def read_details(self, path):
+        """按需读取版本列表与历史。"""
+        code, _, _ = self._run_git(['rev-parse', '--verify', '@{u}'], path)
+        return dict(versions=self._local_versions(path),
+                    history=self._history_text(path, code == 0), details_loaded=True)
+
+    def inspect(self, path, fetch=False, details=True):
+        """检查状态；列表扫描可跳过版本历史，fetch=False 不联网。"""
+        path = os.path.abspath(os.path.normpath(path))
+        base = self._inspect_status(path, fetch)
+        if details and base['git']:
+            base.update(self.read_details(path))
+        return base
+
+    def _inspect_status(self, path, fetch):
+        base = self.describe(path)
+        if not base['git']:
+            return base
+        code, commit, err = self._run_git(
+            ['log', '-1', '--format=%h - %s (%cd)', '--date=short'], path)
         if code != 0:
             base.update(status='检查失败', detail='无法读取 Git 仓库：%s' % (err or '没有有效提交'))
             return base
-
+        base['commit'] = commit
         fetch_note = ''
         if fetch:
             code, _, err = self._run_git(['fetch', '--prune'], path)
             if code != 0:
-                base['versions'] = self._local_versions(path)
-                base['commit'] = self._current_commit(path)
-                base['history'] = self._history_text(path, False)
                 base.update(status='检查失败',
                             detail='拉取远端失败（fetch --prune）：%s' % (err or '未知错误'))
                 return base
@@ -185,34 +223,20 @@ class Operations:
 
         branch = self._current_branch(path)
         if branch is None:
-            # 游离 HEAD：一般是之前切到了历史 tag / commit。
-            base['versions'] = self._local_versions(path)
-            base['commit'] = self._current_commit(path)
-            base['history'] = self._history_text(path, False)
-            base.update(status='游离HEAD（历史版本）', update=False,
+            base.update(status='游离HEAD（历史版本）',
                         detail='当前为游离 HEAD（历史版本）%s，选“%s”可回到默认分支再更新。'
                                % (fetch_note, LATEST))
             return base
-
-        # 取上游分支，无上游则直接说明。
         code, upstream, _ = self._run_git(
             ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], path)
         if code != 0 or not upstream.strip():
-            base['versions'] = self._local_versions(path)
-            base['commit'] = self._current_commit(path)
-            base['history'] = self._history_text(path, False)
-            base.update(status='无上游分支', update=False,
+            base.update(status='无上游分支',
                         detail='分支 %s 没有关联上游分支%s。' % (branch, fetch_note))
             return base
         upstream = upstream.strip()
-
-        # machine-readable 的领先/落后计数：左=本地多，右=远端多。
         code, out, err = self._run_git(
             ['rev-list', '--left-right', '--count', 'HEAD...@{u}'], path)
         if code != 0:
-            base['versions'] = self._local_versions(path)
-            base['commit'] = self._current_commit(path)
-            base['history'] = self._history_text(path, True)
             base.update(status='检查失败',
                         detail='读取远端计数失败：%s%s' % (err or '未知错误', fetch_note))
             return base
@@ -220,22 +244,15 @@ class Operations:
             ahead_s, behind_s = out.split()
             ahead, behind = int(ahead_s), int(behind_s)
         except (ValueError, AttributeError):
-            base['versions'] = self._local_versions(path)
-            base['commit'] = self._current_commit(path)
-            base['history'] = self._history_text(path, True)
             base.update(status='检查失败', detail='远端计数解析失败%s。' % fetch_note)
             return base
-
-        base['versions'] = self._local_versions(path)
-        base['commit'] = self._current_commit(path)
-        base['history'] = self._history_text(path, True)
         pos = '分支 %s，上游 %s，本地领先 %d、落后 %d%s' % (
             branch, upstream, ahead, behind, fetch_note)
         if behind > 0 and ahead == 0:
             base.update(status='有更新（落后远端）', update=True,
                         detail='远端有 %d 个新提交可更新。%s' % (behind, pos))
         elif ahead > 0 and behind == 0:
-            base.update(status='本地领先（远端无新内容）', update=False,
+            base.update(status='本地领先（远端无新内容）',
                         detail='本地比远端多 %d 个提交，远端无新内容。%s' % (ahead, pos))
         elif ahead > 0 and behind > 0:
             base.update(status='本地与远端分叉', update=True,
@@ -243,7 +260,7 @@ class Operations:
                                % (ahead, behind, pos))
         else:
             base.update(status='最新版本' if fetch else '与本地远端记录一致',
-                        update=False, detail='与远端记录一致。%s' % pos)
+                        detail='与远端记录一致。%s' % pos)
         return base
 
     def update(self, path, selection):
